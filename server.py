@@ -5,6 +5,7 @@ from aiohttp import web, WSMsgType, WSCloseCode
 import argparse
 import json
 import time
+import socket
 
 class StreamHub:
     def __init__(self):
@@ -16,7 +17,8 @@ class StreamHub:
         self._bytes_total = 0
 
     async def add_listener(self) -> asyncio.Queue:
-        q = asyncio.Queue(maxsize=256)    # небольшая очередь, чтобы ограничить задержку
+        # q = asyncio.Queue(maxsize=256)    # небольшая очередь, чтобы ограничить задержку
+        q = asyncio.Queue(maxsize=16)  # маленькая очередь 
         async with self.lock:
             self.listeners.add(q)
         return q
@@ -121,20 +123,43 @@ async def listen_mp3(request: web.Request):
         headers={
             'Content-Type': 'audio/mpeg',
             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Pragma': 'no-cache',
             'Connection': 'keep-alive',
-            # Опционально можно указать ICY-заголовки для некоторых плееров:
+            'X-Accel-Buffering': 'no',  # если стоит nginx — отключает прокси-буферизацию
             'icy-name': 'SimplePythonStream',
             'icy-genre': 'Live',
         }
     )
     await resp.prepare(request)
-    q = await hub.add_listener()
+
+    # Агрессивно уменьшаем задержки TCP
     try:
-        # Если стрима нет — просто ждём появления данных.
+        transport = request.transport
+        if transport:
+            transport.set_write_buffer_limits(0, 0)
+            sock = transport.get_extra_info('socket')
+            if sock and hasattr(socket, "TCP_NODELAY"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
+    q = await hub.add_listener()
+    # дренить не на каждый чанк
+    chunks_since_drain = 0
+    try:
         while True:
             chunk = await q.get()
             await resp.write(chunk)
-            await resp.drain()
+            chunks_since_drain += 1
+            # дреним только если буфер вырос или раз в 8 чанков
+            if chunks_since_drain >= 8:
+                chunks_since_drain = 0
+                await resp.drain()
+            else:
+                tr = request.transport
+                if tr and tr.get_write_buffer_size() > 256 * 1024:
+                    chunks_since_drain = 0
+                    await resp.drain()
     except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
         pass
     finally:
@@ -142,6 +167,7 @@ async def listen_mp3(request: web.Request):
         with contextlib.suppress(Exception):
             await resp.write_eof()
     return resp
+
 
 async def uplink(request: web.Request):
     # Один активный стример
