@@ -176,41 +176,36 @@ def delete_virtual_device_interactive(parent: tk.Tk):
 def build_ffmpeg_cmd(input_backend: str, device: str, channels: int, rate: int, bitrate_kbps: int):
     if not FFMPEG_BIN:
         raise RuntimeError("ffmpeg не найден. Установите пакет ffmpeg.")
-
-    common = [
-        FFMPEG_BIN,
-        "-hide_banner",
-        "-loglevel", "error",
-        # вход
-        "-thread_queue_size", "64",           # меньше лагов при пиковой нагрузке
-        "-fflags", "nobuffer",                # низкая задержка ввода
-        "-flags", "low_delay",                # низкая задержка кодека/мультиплексора
-        "-flush_packets", "1",                # сбрасывать пакеты сразу
-        # кодек
-        "-vn", "-sn", "-dn",
-        "-ac", str(channels),
-        "-ar", str(rate),
-        "-codec:a", "libmp3lame",
-        "-b:a", f"{bitrate_kbps}k",           # CBR для предсказуемой задержки
-        "-write_xing", "0",                   # не писать XING (быстрее старт стрима)
-        # выход
-        "-f", "mp3",
-        "-"                                   # в stdout
-    ]
-
     if input_backend == "pulse":
         return [
-            FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
-            "-f", "pulse", "-i", device,
-        ] + common[4:]
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "pulse",
+            "-i", device,
+            "-ac", str(channels),
+            "-ar", str(rate),
+            "-codec:a", "libmp3lame",
+            "-b:a", f"{bitrate_kbps}k",
+            "-f", "mp3",
+            "-"  # stdout
+        ]
     elif input_backend == "alsa":
         return [
-            FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
-            "-f", "alsa", "-i", device,
-        ] + common[4:]
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "alsa",
+            "-i", device,
+            "-ac", str(channels),
+            "-ar", str(rate),
+            "-codec:a", "libmp3lame",
+            "-b:a", f"{bitrate_kbps}k",
+            "-f", "mp3",
+            "-"
+        ]
     else:
         raise ValueError(f"Неизвестный backend: {input_backend}")
-
 
 # ---------------- Streaming core (asyncio in a background thread) ----------------
 
@@ -589,8 +584,8 @@ class App(tk.Tk):
                 channels=int(self.var_channels.get()),
                 rate=int(self.var_rate.get()),
                 bitrate=int(self.var_bitrate.get()),
-                # chunk_size=4096
-                chunk_size=1024  # ~64 мс на кусок при 128 кбит/с
+                chunk_size=4096
+                # chunk_size=8196
             )
             self.btn_start.config(state="disabled")
             self.btn_stop.config(state="normal")

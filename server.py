@@ -6,6 +6,9 @@ import argparse
 import json
 import time
 import socket
+import contextlib
+
+# ---------------- Core hub ----------------
 
 class StreamHub:
     def __init__(self):
@@ -17,8 +20,8 @@ class StreamHub:
         self._bytes_total = 0
 
     async def add_listener(self) -> asyncio.Queue:
-        # q = asyncio.Queue(maxsize=256)    # небольшая очередь, чтобы ограничить задержку
-        q = asyncio.Queue(maxsize=16)  # маленькая очередь 
+        # Маленькая очередь минимизирует задержку у каждого слушателя.
+        q = asyncio.Queue(maxsize=16)
         async with self.lock:
             self.listeners.add(q)
         return q
@@ -28,15 +31,13 @@ class StreamHub:
             self.listeners.discard(q)
 
     async def broadcast(self, data: bytes):
-        # Рассылаем всем слушателям; если очередь переполнена — очищаем и кладём свежие данные,
-        # чтобы держать задержку минимальной.
+        # Рассылаем всем слушателям; при переполнении дропаем старые данные, кладём свежие.
         dead = []
         for q in list(self.listeners):
             try:
                 q.put_nowait(data)
             except asyncio.QueueFull:
                 try:
-                    # быстрый дроп накопившегося
                     while not q.empty():
                         q.get_nowait()
                     q.put_nowait(data)
@@ -62,12 +63,14 @@ class StreamHub:
 
 hub = StreamHub()
 
+# ---------------- HTTP handlers ----------------
+
 async def index(request: web.Request):
     html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Простой аудио-стрим</title>
+<title>Простой аудио-стрим (низкая задержка)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }}
@@ -81,21 +84,21 @@ audio {{ width: 100%; margin-top: 1rem; }}
 <body>
 <div class="card">
   <h1>Аудио‑стрим</h1>
-  <p class="meta">Откройте эту страницу и нажмите Play, если автозапуск запрещён в браузере.</p>
+  <p class="meta">Если автозапуск запрещён в браузере — нажмите Play.</p>
   <div>
     <span class="badge" id="bActive">Статус: offline</span>
     <span class="badge" id="bListeners">Слушателей: 0</span>
     <span class="badge" id="bUptime">Аптайм: 0 c</span>
   </div>
-  <audio id="player" controls autoplay src="/listen.mp3"></audio>
+  <audio id="player" controls autoplay preload="none" playsinline controlslist="noplaybackrate nodownload" src="/listen.mp3"></audio>
   <p style="color:#666; font-size: 0.9rem;">
-    Совместимо с современными браузерами. Формат: MP3 (audio/mpeg), потоковая передача по HTTP chunked.
+    Формат: MP3 (audio/mpeg), HTTP chunked. Кэш отключён, воспроизводится только текущая трансляция.
   </p>
 </div>
 <script>
 async function refresh() {{
   try {{
-    const r = await fetch('/stats');
+    const r = await fetch('/stats', {{cache:'no-store'}});
     const s = await r.json();
     document.getElementById('bActive').textContent = 'Статус: ' + (s.active ? 'online' : 'offline');
     document.getElementById('bListeners').textContent = 'Слушателей: ' + s.listeners;
@@ -104,62 +107,73 @@ async function refresh() {{
 }}
 setInterval(refresh, 1000);
 refresh();
+
+// Фиксация на live-краю: не позволяем «уходить назад» в рамках текущей сессии
+const audio = document.getElementById('player');
+function snapToLive() {{
+  try {{
+    const r = audio.seekable;
+    if (r && r.length) {{
+      const liveEdge = r.end(r.length - 1);
+      if (liveEdge - audio.currentTime > 0.35) {{
+        audio.currentTime = Math.max(0, liveEdge - 0.1);
+      }}
+    }}
+  }} catch(e) {{}}
+}}
+audio.addEventListener('seeking', snapToLive);
+audio.addEventListener('loadedmetadata', snapToLive);
 </script>
 </body>
 </html>"""
-    # return web.Response(text=html, content_type="text/html; charset=utf-8")
-    # return web.Response(text=html, contenttype="text/html")
     return web.Response(text=html, content_type="text/html")
 
-
 async def stats(request: web.Request):
-    return web.json_response(hub.stats())
+    return web.json_response(hub.stats(), headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, private",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
 
 async def listen_mp3(request: web.Request):
-    # Возвращаем поток audio/mpeg. Слушатель получает данные "как есть".
+    # Стримим текущие mp3-данные "как есть". Кэш и Range отключаем намеренно.
     resp = web.StreamResponse(
         status=200,
         reason='OK',
         headers={
             'Content-Type': 'audio/mpeg',
-            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0, private',
             'Pragma': 'no-cache',
+            'Expires': '0',
+            'Accept-Ranges': 'none',           # запрет Range, чтобы не было таймшифта с сервера
             'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',  # если стоит nginx — отключает прокси-буферизацию
+            'X-Accel-Buffering': 'no',         # если вдруг есть nginx перед приложением
             'icy-name': 'SimplePythonStream',
             'icy-genre': 'Live',
         }
     )
     await resp.prepare(request)
 
-    # Агрессивно уменьшаем задержки TCP
+    # Включаем TCP_NODELAY для уменьшения задержки мелких пакетов.
     try:
-        transport = request.transport
-        if transport:
-            transport.set_write_buffer_limits(0, 0)
-            sock = transport.get_extra_info('socket')
-            if sock and hasattr(socket, "TCP_NODELAY"):
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        tr = request.transport
+        if tr:
+            sock = tr.get_extra_info('socket')
+            import socket as _socket
+            if sock and hasattr(_socket, "TCP_NODELAY"):
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
     except Exception:
         pass
 
     q = await hub.add_listener()
-    # дренить не на каждый чанк
-    chunks_since_drain = 0
     try:
         while True:
             chunk = await q.get()
+            # write уже ждёт освобождения буфера транспорта при необходимости (вместо drain)
             await resp.write(chunk)
-            chunks_since_drain += 1
-            # дреним только если буфер вырос или раз в 8 чанков
-            if chunks_since_drain >= 8:
-                chunks_since_drain = 0
-                await resp.drain()
-            else:
-                tr = request.transport
-                if tr and tr.get_write_buffer_size() > 256 * 1024:
-                    chunks_since_drain = 0
-                    await resp.drain()
+            # по желанию можно иногда уступать цикл:
+            # if resp.transport and resp.transport.get_write_buffer_size() > 256*1024:
+            #     await asyncio.sleep(0)
     except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
         pass
     finally:
@@ -168,13 +182,26 @@ async def listen_mp3(request: web.Request):
             await resp.write_eof()
     return resp
 
+# ---------------- WebSocket uplink (from encoder client) ----------------
 
 async def uplink(request: web.Request):
     # Один активный стример
     if hub.streamer is not None and not hub.streamer.closed:
         return web.Response(status=423, text="Streamer already connected")
-    ws = web.WebSocketResponse(heartbeat=10.0)  # встроенные пинги
+
+    ws = web.WebSocketResponse(heartbeat=10.0, compress=False)
     await ws.prepare(request)
+
+    # Включаем TCP_NODELAY на uplink-соединении
+    try:
+        tr = request.transport
+        if tr:
+            sock = tr.get_extra_info('socket')
+            if sock and hasattr(socket, "TCP_NODELAY"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
     hub.streamer = ws
     hub.active = False
     hub.started_at = None
@@ -187,29 +214,33 @@ async def uplink(request: web.Request):
                 data = msg.data
                 if not data:
                     continue
-                # Приняли аудиоданные — ретрансляция
+                # Ретрансляция всем слушателям
                 await hub.broadcast(data)
+
                 if not ack_sent:
                     hub.active = True
                     hub.started_at = time.time()
-                    ack = {
+                    await ws.send_json({
                         "type": "ack",
                         "status": "streaming_started",
                         "listeners": hub.listeners_count(),
-                        "message": "Сервер принимает аудио и транслирует /listen.mp3"
-                    }
-                    await ws.send_json(ack)
+                        "message": "Сервер принимает аудио и транслирует /listen.mp3",
+                    })
                     ack_sent = True
+
             elif msg.type == WSMsgType.TEXT:
-                # опционально поддержим ping от клиента
                 if msg.data == "ping":
                     await ws.send_str("pong")
+
             elif msg.type == WSMsgType.ERROR:
                 print(f"[server] ws error: {ws.exception()}")
                 break
+
         return ws
+
     except Exception as e:
         print(f"[server] exception: {e}")
+
     finally:
         # Стример отключился
         try:
@@ -220,7 +251,10 @@ async def uplink(request: web.Request):
             hub.streamer = None
         hub.active = False
         print("[server] streamer disconnected")
+
     return ws
+
+# ---------------- Periodic stats push to streamer ----------------
 
 async def streamer_stats_push():
     # Периодически отправляем стримеру статистику, если подключён
@@ -249,7 +283,7 @@ async def on_cleanup(app):
         with contextlib.suppress(Exception):
             await task
 
-import contextlib
+# ---------------- App factory / main ----------------
 
 def make_app():
     app = web.Application()
@@ -262,7 +296,7 @@ def make_app():
     return app
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple audio stream server")
+    parser = argparse.ArgumentParser(description="Simple low-latency audio stream server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
