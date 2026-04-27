@@ -38,6 +38,7 @@ class LiveKitStreamClient:
         channels: int = 1,
         sample_rate: int = 48000,
     ) -> None:
+        # `channels` is kept for callers (e.g. GUI); native capture is always mono — see MediaDevices note below.
         self.state = LiveKitState(running=True, started_at=time.time())
         self.ui_callback(self.state)
         self._stop_event = asyncio.Event()
@@ -55,10 +56,24 @@ class LiveKitStreamClient:
             return
 
         try:
-            devices = rtc.MediaDevices()
-            open_kwargs = {"num_channels": channels, "sample_rate": sample_rate}
+            loop = asyncio.get_running_loop()
+            # livekit.rtc.MediaDevices builds each frame from indata[start:end, 0] only, but still
+            # passes num_channels to AudioFrame. With num_channels=2 that would require interleaved
+            # stereo bytes; the buffer is only one channel → ValueError. Use mono capture for LiveKit.
+            devices = rtc.MediaDevices(
+                loop=loop,
+                input_sample_rate=int(sample_rate),
+                output_sample_rate=int(sample_rate),
+                num_channels=1,
+            )
+            open_kwargs: dict = {}
             if device_id not in (None, ""):
-                open_kwargs["device_id"] = device_id
+                try:
+                    open_kwargs["input_device"] = int(device_id)
+                except ValueError:
+                    self.state.last_error = f"Некорректный индекс устройства: {device_id!r}"
+                    await self.stop()
+                    return
             self.mic = devices.open_input(**open_kwargs)
             self.track = rtc.LocalAudioTrack.create_audio_track("input", self.mic.source)
             opts = rtc.TrackPublishOptions()

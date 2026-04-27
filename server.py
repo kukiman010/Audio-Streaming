@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import html
 import os
 import sys
 from pathlib import Path
@@ -29,25 +30,46 @@ def build_token(api_key: str, api_secret: str, room: str, identity: str, publish
     )
 
 
-async def index(_: web.Request) -> web.Response:
-    html = """<!doctype html>
-<html lang="en">
+def _default_livekit_ws_url(request: web.Request) -> str:
+    """URL для поля ввода: LIVEKIT_URL из env, иначе ws://<host запроса>:7880 для LAN, иначе localhost."""
+    env_url = os.getenv("LIVEKIT_URL", "").strip()
+    if env_url:
+        return env_url
+    try:
+        h = request.url.host
+        if h and h not in ("127.0.0.1", "localhost", "::1"):
+            return f"ws://{h}:7880"
+    except Exception:
+        pass
+    return "ws://127.0.0.1:7880"
+
+
+async def index(request: web.Request) -> web.Response:
+    default_lk = html.escape(_default_livekit_ws_url(request), quote=True)
+    page = f"""<!doctype html>
+<html lang="ru">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>LiveKit Audio Viewer</title>
   <style>
-    body { font-family: sans-serif; margin: 2rem; }
-    .card { max-width: 800px; margin: 0 auto; padding: 1rem; border: 1px solid #ddd; border-radius: 10px; }
-    input, button { padding: 8px; margin: 4px 0; width: 100%; box-sizing: border-box; }
-    .status { margin-top: 8px; color: #444; }
+    body {{ font-family: sans-serif; margin: 2rem; }}
+    .card {{ max-width: 800px; margin: 0 auto; padding: 1rem; border: 1px solid #ddd; border-radius: 10px; }}
+    input, button {{ padding: 8px; margin: 4px 0; width: 100%; box-sizing: border-box; }}
+    .status {{ margin-top: 8px; color: #444; white-space: pre-wrap; }}
+    .hint {{ font-size: 0.9rem; color: #555; margin: 0.5rem 0 1rem; line-height: 1.4; }}
   </style>
 </head>
 <body>
   <div class="card">
     <h2>LiveKit Audio Viewer</h2>
+    <p class="hint">
+      <strong>LiveKit WS URL</strong> — адрес сигнального WebSocket (порт обычно 7880). Значение по умолчанию подставляется из LIVEKIT_URL или из имени хоста этой страницы.
+      С другого ПК/телефона нельзя оставлять <code>127.0.0.1</code> — укажите IP или имя машины, где запущен LiveKit.
+      Страница открыта по HTTPS — нужен <code>wss://</code> и TLS на стороне LiveKit (иначе браузер блокирует «небезопасный» ws).
+    </p>
     <label>LiveKit WS URL</label>
-    <input id="url" value="ws://127.0.0.1:7880" />
+    <input id="url" value="{default_lk}" />
     <label>Room</label>
     <input id="room" value="audio-room" />
     <label>Identity</label>
@@ -57,43 +79,54 @@ async def index(_: web.Request) -> web.Response:
     <audio id="audio" autoplay controls></audio>
   </div>
   <script type="module">
-    import { Room } from "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.esm.mjs";
+    import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.esm.mjs";
     const joinBtn = document.getElementById("join");
     const status = document.getElementById("status");
     const audio = document.getElementById("audio");
     let roomRef = null;
 
-    joinBtn.addEventListener("click", async () => {
-      try {
-        if (roomRef) {
+    joinBtn.addEventListener("click", async () => {{
+      try {{
+        if (roomRef) {{
           await roomRef.disconnect();
           roomRef = null;
-        }
-        const url = document.getElementById("url").value;
+        }}
+        const url = document.getElementById("url").value.trim();
         const room = document.getElementById("room").value;
         const identity = document.getElementById("identity").value;
-        const tokenResp = await fetch(`/livekit/token?room=${encodeURIComponent(room)}&identity=${encodeURIComponent(identity)}&role=viewer`, { cache: "no-store" });
+        const tokenResp = await fetch(`/livekit/token?room=${{encodeURIComponent(room)}}&identity=${{encodeURIComponent(identity)}}&role=viewer`, {{ cache: "no-store" }});
+        if (!tokenResp.ok) {{
+          const errBody = await tokenResp.text();
+          throw new Error("токен: HTTP " + tokenResp.status + " " + errBody);
+        }}
         const tokenJson = await tokenResp.json();
+        if (!tokenJson.token) {{
+          throw new Error(tokenJson.error || "ответ без token");
+        }}
         const lkRoom = new Room();
-        lkRoom.on("trackSubscribed", (track) => {
-          if (track.kind === "audio") {
+        lkRoom.on("trackSubscribed", (track) => {{
+          if (track.kind === "audio") {{
             track.attach(audio);
             status.textContent = "audio subscribed";
-          }
-        });
-        lkRoom.on("disconnected", () => { status.textContent = "disconnected"; });
+          }}
+        }});
+        lkRoom.on("disconnected", () => {{ status.textContent = "disconnected"; }});
         await lkRoom.connect(url, tokenJson.token);
         roomRef = lkRoom;
         status.textContent = "connected";
-      } catch (e) {
-        status.textContent = `error: ${e}`;
-      }
-    });
+      }} catch (e) {{
+        let msg = (e && e.message) ? e.message : String(e);
+        if (/Failed to fetch|NetworkError|load failed/i.test(msg)) {{
+          msg += "\\n\\nЧастые причины: неверный хост (127.0.0.1 с другого устройства), LiveKit не запущен, порт 7880 закрыт файрволом, или страница по HTTPS а URL начинается с ws:// (нужен wss://).";
+        }}
+        status.textContent = "error: " + msg;
+      }}
+    }});
   </script>
 </body>
 </html>
 """
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(text=page, content_type="text/html")
 
 
 async def healthz(_: web.Request) -> web.Response:
