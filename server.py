@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import sys
+from pathlib import Path
+
 from aiohttp import web
 import livekit.api as api
 from env_loader import load_env_files
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def build_token(api_key: str, api_secret: str, room: str, identity: str, publish: bool) -> str:
@@ -133,12 +138,59 @@ def make_app() -> web.Application:
     return app
 
 
+def _load_project_env() -> None:
+    load_env_files((str(_SCRIPT_DIR / "livekit.env"), str(_SCRIPT_DIR / ".env")))
+    load_env_files(("livekit.env", ".env"), override_existing=True)
+
+
+def _client_facing_helper_url(bind_port: int) -> str:
+    explicit = os.getenv("HELPER_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    return f"http://127.0.0.1:{bind_port}"
+
+
+def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
+    lk_url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880").strip()
+    helper_url = _client_facing_helper_url(bind_port)
+    pairing = os.getenv("LIVEKIT_PAIRING_SECRET", "").strip()
+    room = "audio-room"
+    publisher_id = os.getenv("LIVEKIT_PUBLISHER_IDENTITY", "publisher-local").strip() or "publisher-local"
+    viewer_id = "web-viewer"
+
+    lines = [
+        "",
+        "=" * 72,
+        "  Параметры для GUI-клиента и веб-просмотра (скопируйте в клиент на своей машине)",
+        "=" * 72,
+        f"  LiveKit URL (ws/wss):     {lk_url}",
+        f"  Helper URL (http):        {helper_url}",
+        f"  Комната (room):           {room}   (любое совпадающее имя у publisher и viewer)",
+        f"  Identity (publisher):    {publisher_id}",
+        f"  Identity (web viewer):    {viewer_id}",
+    ]
+    if pairing:
+        lines.append(f"  Pairing secret:           {pairing}")
+    else:
+        lines.append("  Pairing secret:           (не задан — задайте LIVEKIT_PAIRING_SECRET в livekit.env)")
+    lines += [
+        "",
+        f"  Helper слушает:           http://{bind_host}:{bind_port}/",
+        "  Если клиент с другой машины: выставьте в livekit.env HELPER_URL с публичным IP/доменом",
+        "  и тот же LIVEKIT_URL (порт LiveKit обычно 7880).",
+        "=" * 72,
+        "",
+    ]
+    print("\n".join(lines), file=sys.stderr)
+
+
 def main() -> None:
-    load_env_files(("livekit.env", ".env"))
+    _load_project_env()
     parser = argparse.ArgumentParser(description="LiveKit helper service for web viewer + token issuing")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
+    print_client_connection_banner(bind_host=args.host, bind_port=args.port)
     web.run_app(make_app(), host=args.host, port=args.port)
 
 

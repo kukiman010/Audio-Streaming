@@ -14,7 +14,7 @@ def _parse_env_line(line: str):
     return key, value
 
 
-def load_env_files(paths: Iterable[str]) -> None:
+def load_env_files(paths: Iterable[str], *, override_existing: bool = False) -> None:
     for path in paths:
         if not os.path.exists(path):
             continue
@@ -22,7 +22,7 @@ def load_env_files(paths: Iterable[str]) -> None:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     key, value = _parse_env_line(line)
-                    if key and key not in os.environ:
+                    if key and (override_existing or key not in os.environ):
                         os.environ[key] = value
         except OSError:
             continue

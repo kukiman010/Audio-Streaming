@@ -67,5 +67,13 @@ fi
 echo "Starting LiveKit stack with Docker Compose..."
 docker compose -f "deploy/livekit/docker-compose.yml" up -d
 
-echo "Starting helper server on ${HELPER_HOST:-0.0.0.0}:${HELPER_PORT:-8000}..."
-exec python "server.py" --host "${HELPER_HOST:-0.0.0.0}" --port "${HELPER_PORT:-8000}"
+HP="${HELPER_PORT:-8000}"
+HH="${HELPER_HOST:-0.0.0.0}"
+echo ""
+echo "------------------------------------------------------------------------"
+echo "  После строки 'Running on' ниже — блок «Параметры для GUI-клиента»."
+echo "  Один IP/хост: задайте LIVEKIT_URL и HELPER_URL в livekit.env с этим адресом."
+echo "  Пример: LIVEKIT_URL=ws://194.0.194.14:7880  HELPER_URL=http://194.0.194.14:${HP}"
+echo "------------------------------------------------------------------------"
+echo "Starting helper server on ${HH}:${HP}..."
+exec python "server.py" --host "${HH}" --port "${HP}"

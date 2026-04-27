@@ -9,7 +9,8 @@ import time
 import os
 import re
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable
 
@@ -31,9 +32,17 @@ PACTL_BIN = shutil.which("pactl") or "/usr/bin/pactl"
 
 # Префикс для своих виртуальных устройств PulseAudio (как в audio_recorder.py)
 PREFIX = "MYAPP_"
-load_env_files(("livekit.env", ".env"))
+# Сначала каталог скрипта (Windows/запуск не из корня проекта), затем cwd с приоритетом переопределения.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_env_files(
+    (os.path.join(_SCRIPT_DIR, "livekit.env"), os.path.join(_SCRIPT_DIR, ".env")),
+)
+load_env_files(("livekit.env", ".env"), override_existing=True)
 ENABLE_LEGACY_TRANSPORT = os.getenv("ENABLE_LEGACY_TRANSPORT", "0") == "1"
 DEFAULT_HELPER_URL = os.getenv("HELPER_URL", "http://127.0.0.1:8000")
+DEFAULT_LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
+DEFAULT_LIVEKIT_ROOM = os.getenv("LIVEKIT_DEFAULT_ROOM", "audio-room")
+DEFAULT_LIVEKIT_IDENTITY = os.getenv("LIVEKIT_PUBLISHER_IDENTITY", "publisher-local")
 
 # ---------------- Утилиты обнаружения устройств ----------------
 
@@ -225,11 +234,25 @@ def request_publisher_token(helper_url: str, room: str, identity: str, pairing_s
         }
     )
     url = f"{helper_url.rstrip('/')}/livekit/publisher_token?{query}"
-    with urlopen(url, timeout=6.0) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=10.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        try:
+            msg = json.loads(detail).get("error", detail)
+        except json.JSONDecodeError:
+            msg = detail or str(e)
+        raise RuntimeError(f"Helper HTTP {e.code}: {msg}") from e
+    except URLError as e:
+        raise RuntimeError(
+            f"Не удалось достучаться до helper ({helper_url}). "
+            f"Проверьте URL, порт (часто :8000) и firewall. Причина: {e.reason}"
+        ) from e
     token = payload.get("token", "")
     if not token:
-        raise RuntimeError("Не удалось получить publisher token от helper-сервера.")
+        err = payload.get("error", "")
+        raise RuntimeError(err or "Не удалось получить publisher token от helper-сервера.")
     return token
 
 # ---------------- Streaming core (asyncio in a background thread) ----------------
@@ -508,17 +531,17 @@ class App(tk.Tk):
         self.combo_transport.bind("<<ComboboxSelected>>", lambda e: self.on_transport_changed())
 
         # Server URL
-        self.var_server = tk.StringVar(value="ws://127.0.0.1:7880")
+        self.var_server = tk.StringVar(value=DEFAULT_LIVEKIT_URL)
         ttk.Label(frm, text="LiveKit URL:").grid(row=1, column=0, sticky="w", **pad)
         self.entry_server = ttk.Entry(frm, textvariable=self.var_server, width=55)
         self.entry_server.grid(row=1, column=1, sticky="we", **pad, columnspan=3)
 
         ttk.Label(frm, text="Комната:").grid(row=2, column=0, sticky="w", **pad)
-        self.var_room = tk.StringVar(value="audio-room")
+        self.var_room = tk.StringVar(value=DEFAULT_LIVEKIT_ROOM)
         ttk.Entry(frm, textvariable=self.var_room, width=20).grid(row=2, column=1, sticky="w", **pad)
 
         ttk.Label(frm, text="Identity:").grid(row=2, column=2, sticky="e", **pad)
-        self.var_identity = tk.StringVar(value="publisher-local")
+        self.var_identity = tk.StringVar(value=DEFAULT_LIVEKIT_IDENTITY)
         ttk.Entry(frm, textvariable=self.var_identity, width=20).grid(row=2, column=3, sticky="we", **pad)
 
         ttk.Label(frm, text="Helper URL:").grid(row=3, column=0, sticky="w", **pad)
@@ -642,7 +665,12 @@ class App(tk.Tk):
             room = self.var_room.get().strip()
             identity = self.var_identity.get().strip()
             if not (helper_url and pairing_secret and room and identity):
-                messagebox.showerror("Ошибка", "Заполните helper URL, pairing secret, room и identity.")
+                messagebox.showerror(
+                    "Ошибка",
+                    "Заполните helper URL, pairing secret, комнату и identity.\n\n"
+                    "Pairing secret должен совпадать с LIVEKIT_PAIRING_SECRET на машине helper "
+                    "(файл livekit.env). При старте server.py в консоли выводится блок «параметры для клиента».",
+                )
                 return
             try:
                 token = request_publisher_token(
