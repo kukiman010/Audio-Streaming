@@ -661,6 +661,8 @@ class App(tk.Tk):
                 messagebox.showerror("Ошибка", "Не найдено устройств ввода.")
                 return
             helper_url = self.var_helper_url.get().strip()
+            if helper_url.startswith("ttp://"):
+                helper_url = "http://" + helper_url[6:]
             pairing_secret = self.var_pairing_secret.get().strip()
             room = self.var_room.get().strip()
             identity = self.var_identity.get().strip()

@@ -150,10 +150,57 @@ def _client_facing_helper_url(bind_port: int) -> str:
     return f"http://127.0.0.1:{bind_port}"
 
 
+def collect_livekit_key_mismatch_warnings() -> list[str]:
+    """
+    401 от LiveKit («invalid token» / «no permissions») почти всегда из‑за того, что
+    LIVEKIT_API_KEY / LIVEKIT_API_SECRET в livekit.env не совпадают с keys: в deploy/livekit/livekit.yaml.
+    """
+    warnings: list[str] = []
+    yaml_path = _SCRIPT_DIR / "deploy" / "livekit" / "livekit.yaml"
+    api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
+    api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        warnings.append("LIVEKIT_API_KEY или LIVEKIT_API_SECRET пусты в окружении.")
+        return warnings
+    if not yaml_path.is_file():
+        warnings.append(f"Нет файла {yaml_path} — проверка ключей пропущена.")
+        return warnings
+    try:
+        import yaml
+    except ImportError:
+        warnings.append("Установите PyYAML (pip install PyYAML), чтобы проверять ключи против livekit.yaml.")
+        return warnings
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        warnings.append(f"Не удалось прочитать livekit.yaml: {e}")
+        return warnings
+    keys = (data or {}).get("keys") if isinstance(data, dict) else None
+    if not isinstance(keys, dict):
+        warnings.append("В livekit.yaml нет секции keys — проверьте конфиг Docker LiveKit.")
+        return warnings
+    if api_key not in keys:
+        warnings.append(
+            f"LIVEKIT_API_KEY={api_key!r} отсутствует в keys в livekit.yaml "
+            f"(есть ключи: {list(keys.keys())}). Токены будут отклонены с 401."
+        )
+        return warnings
+    yaml_secret = keys.get(api_key)
+    if yaml_secret != api_secret:
+        warnings.append(
+            "КРИТИЧНО: LIVEKIT_API_SECRET в livekit.env не совпадает с секретом для этого API-ключа "
+            f"в deploy/livekit/livekit.yaml (ключ {api_key!r}). "
+            "Выровняйте значения и перезапустите контейнер LiveKit: "
+            "`docker compose -f deploy/livekit/docker-compose.yml up -d`."
+        )
+    return warnings
+
+
 def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
     lk_url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880").strip()
     helper_url = _client_facing_helper_url(bind_port)
     pairing = os.getenv("LIVEKIT_PAIRING_SECRET", "").strip()
+    api_key_name = os.getenv("LIVEKIT_API_KEY", "").strip()
     room = "audio-room"
     publisher_id = os.getenv("LIVEKIT_PUBLISHER_IDENTITY", "publisher-local").strip() or "publisher-local"
     viewer_id = "web-viewer"
@@ -165,6 +212,7 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
         "=" * 72,
         f"  LiveKit URL (ws/wss):     {lk_url}",
         f"  Helper URL (http):        {helper_url}",
+        f"  API key (имя в JWT):      {api_key_name or '(не задан)'}",
         f"  Комната (room):           {room}   (любое совпадающее имя у publisher и viewer)",
         f"  Identity (publisher):    {publisher_id}",
         f"  Identity (web viewer):    {viewer_id}",
@@ -173,15 +221,32 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
         lines.append(f"  Pairing secret:           {pairing}")
     else:
         lines.append("  Pairing secret:           (не задан — задайте LIVEKIT_PAIRING_SECRET в livekit.env)")
+    if "127.0.0.1" in lk_url or "localhost" in lk_url.lower():
+        lines.append("")
+        lines.append(
+            "  >>> Удалённый клиент: в livekit.env на сервере задайте LIVEKIT_URL и HELPER_URL с публичным IP/доменом,"
+        )
+        lines.append(
+            "      чтобы этот блок совпадал с тем, что вводите в GUI (иначе легко перепутать адреса)."
+        )
     lines += [
         "",
         f"  Helper слушает:           http://{bind_host}:{bind_port}/",
-        "  Если клиент с другой машины: выставьте в livekit.env HELPER_URL с публичным IP/доменом",
-        "  и тот же LIVEKIT_URL (порт LiveKit обычно 7880).",
+        "  Ошибка 401 при подключении к LiveKit: см. проверку ключей выше (livekit.env ↔ livekit.yaml).",
         "=" * 72,
         "",
     ]
     print("\n".join(lines), file=sys.stderr)
+
+    key_issues = collect_livekit_key_mismatch_warnings()
+    if key_issues:
+        print("!!! ПРОБЛЕМА С КЛЮЧАМИ (типичная причина HTTP 401 от LiveKit):", file=sys.stderr)
+        for msg in key_issues:
+            print(f"    • {msg}", file=sys.stderr)
+        print("", file=sys.stderr)
+    else:
+        print("Проверка: LIVEKIT_API_KEY / LIVEKIT_API_SECRET совпадают с deploy/livekit/livekit.yaml.", file=sys.stderr)
+        print("", file=sys.stderr)
 
 
 def main() -> None:

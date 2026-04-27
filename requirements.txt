@@ -7,4 +7,5 @@ psutil
 livekit
 livekit-api
 sounddevice
+PyYAML>=6.0
 
