@@ -67,6 +67,13 @@ fi
 echo "Starting LiveKit stack with Docker Compose..."
 docker compose -f "deploy/livekit/docker-compose.yml" up -d
 
+# LiveKit читает keys из примонтированного livekit.yaml только при старте процесса.
+# Без перезапуска после правки файла контейнер продолжает жить со старыми ключами —
+# тогда helper выдаёт «правильный» JWT по новому livekit.env, а сервер проверяет по старому секрету → HTTP 401.
+echo "Restarting livekit container to reload /etc/livekit/livekit.yaml..."
+docker compose -f "deploy/livekit/docker-compose.yml" restart livekit
+sleep 2
+
 HP="${HELPER_PORT:-8000}"
 HH="${HELPER_HOST:-0.0.0.0}"
 echo ""

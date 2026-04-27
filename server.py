@@ -18,10 +18,12 @@ def build_token(api_key: str, api_secret: str, room: str, identity: str, publish
         can_publish=publish,
         can_subscribe=True,
     )
+    # strip: случайные пробелы/перевод строк в .env ломают подпись JWT vs yaml на сервере
+    key, secret = api_key.strip(), api_secret.strip()
     return (
-        api.AccessToken(api_key, api_secret)
-        .with_identity(identity)
-        .with_name(identity)
+        api.AccessToken(key, secret)
+        .with_identity(identity.strip())
+        .with_name(identity.strip())
         .with_grants(grants)
         .to_jwt()
     )
@@ -99,8 +101,8 @@ async def healthz(_: web.Request) -> web.Response:
 
 
 async def livekit_token(request: web.Request) -> web.Response:
-    api_key = os.getenv("LIVEKIT_API_KEY", "")
-    api_secret = os.getenv("LIVEKIT_API_SECRET", "")
+    api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
+    api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
     if not api_key or not api_secret:
         return web.json_response({"error": "LIVEKIT_API_KEY/SECRET not configured"}, status=500)
 
@@ -113,9 +115,9 @@ async def livekit_token(request: web.Request) -> web.Response:
 
 
 async def livekit_publisher_token(request: web.Request) -> web.Response:
-    api_key = os.getenv("LIVEKIT_API_KEY", "")
-    api_secret = os.getenv("LIVEKIT_API_SECRET", "")
-    pairing_secret = os.getenv("LIVEKIT_PAIRING_SECRET", "")
+    api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
+    api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
+    pairing_secret = os.getenv("LIVEKIT_PAIRING_SECRET", "").strip()
     if not api_key or not api_secret or not pairing_secret:
         return web.json_response({"error": "server secrets not configured"}, status=500)
 
@@ -185,14 +187,25 @@ def collect_livekit_key_mismatch_warnings() -> list[str]:
             f"(есть ключи: {list(keys.keys())}). Токены будут отклонены с 401."
         )
         return warnings
-    yaml_secret = keys.get(api_key)
+    yaml_secret = str(keys.get(api_key) or "").strip()
     if yaml_secret != api_secret:
         warnings.append(
             "КРИТИЧНО: LIVEKIT_API_SECRET в livekit.env не совпадает с секретом для этого API-ключа "
             f"в deploy/livekit/livekit.yaml (ключ {api_key!r}). "
-            "Выровняйте значения и перезапустите контейнер LiveKit: "
-            "`docker compose -f deploy/livekit/docker-compose.yml up -d`."
+            "Выровняйте значения и выполните: "
+            "`docker compose -f deploy/livekit/docker-compose.yml restart livekit`."
         )
+        return warnings
+
+    try:
+        import jwt
+    except ImportError:
+        return warnings
+    try:
+        probe = build_token(api_key, api_secret, "audio-room", "jwt-probe", True)
+        jwt.decode(probe, api_secret, algorithms=["HS256"], options={"verify_aud": False})
+    except Exception as e:
+        warnings.append(f"JWT из тех же ключей локально не проходит проверку подписи: {e}")
     return warnings
 
 
@@ -245,8 +258,29 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
             print(f"    • {msg}", file=sys.stderr)
         print("", file=sys.stderr)
     else:
-        print("Проверка: LIVEKIT_API_KEY / LIVEKIT_API_SECRET совпадают с deploy/livekit/livekit.yaml.", file=sys.stderr)
+        print("Проверка: ключи в livekit.env совпадают с deploy/livekit/livekit.yaml; JWT подпись локально валидна.", file=sys.stderr)
         print("", file=sys.stderr)
+
+    print(
+        "Если клиент всё равно показывает 401 при подключении к LiveKit:",
+        file=sys.stderr,
+    )
+    print(
+        "  • Контейнер livekit после правки livekit.yaml должен быть перезапущен "
+        "(start_server.sh теперь делает restart автоматически).",
+        file=sys.stderr,
+    )
+    print(
+        "  • В момент подключения с клиента выполните: "
+        "`docker compose -f deploy/livekit/docker-compose.yml logs -f livekit` — там может быть "
+        "503/другая ошибка; Rust/Python SDK местами показывает вместо неё «401 no permissions».",
+        file=sys.stderr,
+    )
+    print(
+        "  • Синхронизируйте время на сервере и на ПК с gui_client (NTP); JWT зависит от exp/nbf.",
+        file=sys.stderr,
+    )
+    print("", file=sys.stderr)
 
 
 def main() -> None:

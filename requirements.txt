@@ -8,4 +8,5 @@ livekit
 livekit-api
 sounddevice
 PyYAML>=6.0
+PyJWT>=2.0
 
