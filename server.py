@@ -107,11 +107,29 @@ async def livekit_token(request: web.Request) -> web.Response:
     return web.json_response({"token": token, "room": room, "identity": identity, "role": role})
 
 
+async def livekit_publisher_token(request: web.Request) -> web.Response:
+    api_key = os.getenv("LIVEKIT_API_KEY", "")
+    api_secret = os.getenv("LIVEKIT_API_SECRET", "")
+    pairing_secret = os.getenv("LIVEKIT_PAIRING_SECRET", "")
+    if not api_key or not api_secret or not pairing_secret:
+        return web.json_response({"error": "server secrets not configured"}, status=500)
+
+    room = request.query.get("room", "audio-room")
+    identity = request.query.get("identity", "publisher")
+    provided = request.query.get("pairing_secret", "")
+    if provided != pairing_secret:
+        return web.json_response({"error": "invalid pairing secret"}, status=403)
+
+    token = build_token(api_key=api_key, api_secret=api_secret, room=room, identity=identity, publish=True)
+    return web.json_response({"token": token, "room": room, "identity": identity, "role": "publisher"})
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/livekit/token", livekit_token)
+    app.router.add_get("/livekit/publisher_token", livekit_publisher_token)
     return app
 
 

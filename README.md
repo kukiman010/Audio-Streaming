@@ -60,6 +60,11 @@ cp deploy/livekit/turnserver.conf.example deploy/livekit/turnserver.conf
 ```
 Заполните секреты и домен.
 
+Упрощенный вариант (автогенерация секретов + интерактивные вопросы):
+```bash
+python3 setup_livekit.py
+```
+
 3) Запустите LiveKit + helper web одной командой:
 ```bash
 ./start_server.sh
@@ -81,6 +86,7 @@ python performance_validation.py
 - Начинайте с `48000 Hz`, `1-2` канала; увеличивайте только при необходимости.
 - Для production задавайте длинные секреты (`LIVEKIT_API_SECRET` 32+ байт).
 - `gui_client.py` и `server.py` автоматически читают `livekit.env` и `.env`.
+- Клиент получает publisher token от helper-сервера по `LIVEKIT_PAIRING_SECRET`, поэтому `LIVEKIT_API_SECRET` не нужно вручную вводить в GUI.
 
 ## Локальное тестирование
 

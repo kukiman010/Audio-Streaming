@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
+if [[ ! -f "livekit.env" || ! -f "deploy/livekit/livekit.yaml" || ! -f "deploy/livekit/turnserver.conf" ]]; then
+  echo "First run setup..."
+  python3 "setup_livekit.py"
+fi
+
 if [[ -f "livekit.env" ]]; then
   set -a
   # shellcheck disable=SC1091

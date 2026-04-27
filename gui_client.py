@@ -8,6 +8,8 @@ import threading
 import time
 import os
 import re
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable
 
@@ -15,7 +17,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from audio_devices import list_input_devices, AudioInputDevice
 from livekit_client import LiveKitStreamClient, LiveKitState
-from livekit_token import build_token
 from env_loader import load_env_files
 
 try:
@@ -32,6 +33,7 @@ PACTL_BIN = shutil.which("pactl") or "/usr/bin/pactl"
 PREFIX = "MYAPP_"
 load_env_files(("livekit.env", ".env"))
 ENABLE_LEGACY_TRANSPORT = os.getenv("ENABLE_LEGACY_TRANSPORT", "0") == "1"
+DEFAULT_HELPER_URL = os.getenv("HELPER_URL", "http://127.0.0.1:8000")
 
 # ---------------- Утилиты обнаружения устройств ----------------
 
@@ -212,6 +214,23 @@ def build_ffmpeg_cmd(input_backend: str, device: str, channels: int, rate: int, 
         ]
     else:
         raise ValueError(f"Неизвестный backend: {input_backend}")
+
+
+def request_publisher_token(helper_url: str, room: str, identity: str, pairing_secret: str) -> str:
+    query = urlencode(
+        {
+            "room": room,
+            "identity": identity,
+            "pairing_secret": pairing_secret,
+        }
+    )
+    url = f"{helper_url.rstrip('/')}/livekit/publisher_token?{query}"
+    with urlopen(url, timeout=6.0) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    token = payload.get("token", "")
+    if not token:
+        raise RuntimeError("Не удалось получить publisher token от helper-сервера.")
+    return token
 
 # ---------------- Streaming core (asyncio in a background thread) ----------------
 
@@ -502,15 +521,15 @@ class App(tk.Tk):
         self.var_identity = tk.StringVar(value="publisher-local")
         ttk.Entry(frm, textvariable=self.var_identity, width=20).grid(row=2, column=3, sticky="we", **pad)
 
-        ttk.Label(frm, text="API key:").grid(row=3, column=0, sticky="w", **pad)
-        self.var_api_key = tk.StringVar(value=os.getenv("LIVEKIT_API_KEY", "devkey"))
-        self.entry_api_key = ttk.Entry(frm, textvariable=self.var_api_key, width=20)
-        self.entry_api_key.grid(row=3, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="Helper URL:").grid(row=3, column=0, sticky="w", **pad)
+        self.var_helper_url = tk.StringVar(value=DEFAULT_HELPER_URL)
+        self.entry_helper_url = ttk.Entry(frm, textvariable=self.var_helper_url, width=20)
+        self.entry_helper_url.grid(row=3, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="API secret:").grid(row=3, column=2, sticky="e", **pad)
-        self.var_api_secret = tk.StringVar(value=os.getenv("LIVEKIT_API_SECRET", ""))
-        self.entry_api_secret = ttk.Entry(frm, textvariable=self.var_api_secret, width=20, show="*")
-        self.entry_api_secret.grid(row=3, column=3, sticky="we", **pad)
+        ttk.Label(frm, text="Pairing secret:").grid(row=3, column=2, sticky="e", **pad)
+        self.var_pairing_secret = tk.StringVar(value=os.getenv("LIVEKIT_PAIRING_SECRET", ""))
+        self.entry_pairing_secret = ttk.Entry(frm, textvariable=self.var_pairing_secret, width=20, show="*")
+        self.entry_pairing_secret.grid(row=3, column=3, sticky="we", **pad)
 
         # Device
         ttk.Label(frm, text="Источник аудио:").grid(row=4, column=0, sticky="w", **pad)
@@ -576,8 +595,8 @@ class App(tk.Tk):
 
     def on_transport_changed(self):
         is_livekit = self.var_transport.get() == "LiveKit (native)"
-        self.entry_api_key.config(state="normal" if is_livekit else "disabled")
-        self.entry_api_secret.config(state="normal" if is_livekit else "disabled")
+        self.entry_helper_url.config(state="normal" if is_livekit else "disabled")
+        self.entry_pairing_secret.config(state="normal" if is_livekit else "disabled")
         self.spin_bitrate.config(state="disabled" if is_livekit else "normal")
         self.btn_create.config(state="disabled" if is_livekit else "normal")
         self.btn_delete.config(state="disabled" if is_livekit else "normal")
@@ -618,21 +637,19 @@ class App(tk.Tk):
             if not self.input_devices:
                 messagebox.showerror("Ошибка", "Не найдено устройств ввода.")
                 return
-            api_key = self.var_api_key.get().strip()
-            api_secret = self.var_api_secret.get().strip()
+            helper_url = self.var_helper_url.get().strip()
+            pairing_secret = self.var_pairing_secret.get().strip()
             room = self.var_room.get().strip()
             identity = self.var_identity.get().strip()
-            if not (api_key and api_secret and room and identity):
-                messagebox.showerror("Ошибка", "Заполните API key/secret, room и identity.")
+            if not (helper_url and pairing_secret and room and identity):
+                messagebox.showerror("Ошибка", "Заполните helper URL, pairing secret, room и identity.")
                 return
             try:
-                token = build_token(
-                    api_key=api_key,
-                    api_secret=api_secret,
+                token = request_publisher_token(
+                    helper_url=helper_url,
                     room=room,
                     identity=identity,
-                    can_publish=True,
-                    can_subscribe=True,
+                    pairing_secret=pairing_secret,
                 )
                 device = self.input_devices[dev_idx] if (0 <= dev_idx < len(self.input_devices)) else self.input_devices[0]
                 self.livekit_client.start(
