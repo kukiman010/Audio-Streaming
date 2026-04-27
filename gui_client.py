@@ -16,6 +16,7 @@ from tkinter import ttk, messagebox, simpledialog
 from audio_devices import list_input_devices, AudioInputDevice
 from livekit_client import LiveKitStreamClient, LiveKitState
 from livekit_token import build_token
+from env_loader import load_env_files
 
 try:
     from aiohttp import ClientSession, WSMsgType, ClientConnectorError, WSServerHandshakeError
@@ -29,6 +30,7 @@ PACTL_BIN = shutil.which("pactl") or "/usr/bin/pactl"
 
 # Префикс для своих виртуальных устройств PulseAudio (как в audio_recorder.py)
 PREFIX = "MYAPP_"
+load_env_files(("livekit.env", ".env"))
 ENABLE_LEGACY_TRANSPORT = os.getenv("ENABLE_LEGACY_TRANSPORT", "0") == "1"
 
 # ---------------- Утилиты обнаружения устройств ----------------

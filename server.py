@@ -3,6 +3,7 @@ import argparse
 import os
 from aiohttp import web
 import livekit.api as api
+from env_loader import load_env_files
 
 
 def build_token(api_key: str, api_secret: str, room: str, identity: str, publish: bool) -> str:
@@ -115,6 +116,7 @@ def make_app() -> web.Application:
 
 
 def main() -> None:
+    load_env_files(("livekit.env", ".env"))
     parser = argparse.ArgumentParser(description="LiveKit helper service for web viewer + token issuing")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

@@ -50,33 +50,27 @@ python3 streamer.py
 1) Установите зависимости:
 ```bash
 python -m pip install -r requirements.txt
-python -m pip install livekit-api
 ```
 
-2) Разверните LiveKit self-host:
-- Используйте `deploy/livekit/docker-compose.yml`
-- Скопируйте:
-  - `deploy/livekit/livekit.yaml.example -> deploy/livekit/livekit.yaml`
-  - `deploy/livekit/turnserver.conf.example -> deploy/livekit/turnserver.conf`
-- Заполните секреты и домен, затем поднимите сервисы.
-
-3) Задайте переменные окружения для token helper:
+2) Подготовьте env и конфиги:
 ```bash
-export LIVEKIT_API_KEY=devkey
-export LIVEKIT_API_SECRET=replace_with_long_secret
+cp livekit.env.example livekit.env
+cp deploy/livekit/livekit.yaml.example deploy/livekit/livekit.yaml
+cp deploy/livekit/turnserver.conf.example deploy/livekit/turnserver.conf
 ```
+Заполните секреты и домен.
 
-4) Запустите helper web:
+3) Запустите LiveKit + helper web одной командой:
 ```bash
-python server.py --host 0.0.0.0 --port 8000
+./start_server.sh
 ```
 
-5) Запустите клиент:
+4) Запустите клиент:
 ```bash
 python gui_client.py
 ```
 
-6) Проверка smoke/perf:
+5) Проверка smoke/perf:
 ```bash
 python performance_validation.py
 ```
@@ -86,6 +80,7 @@ python performance_validation.py
 - Используйте UDP и рабочий TURN (coturn) для клиентов за NAT.
 - Начинайте с `48000 Hz`, `1-2` канала; увеличивайте только при необходимости.
 - Для production задавайте длинные секреты (`LIVEKIT_API_SECRET` 32+ байт).
+- `gui_client.py` и `server.py` автоматически читают `livekit.env` и `.env`.
 
 ## Локальное тестирование
 
