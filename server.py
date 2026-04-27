@@ -30,8 +30,8 @@ def build_token(api_key: str, api_secret: str, room: str, identity: str, publish
     )
 
 
-def _default_livekit_ws_url(request: web.Request) -> str:
-    """URL для поля ввода: LIVEKIT_URL из env, иначе ws://<host запроса>:7880 для LAN, иначе localhost."""
+def livekit_public_ws_url(request: web.Request) -> str:
+    """Сигнальный WebSocket LiveKit: LIVEKIT_URL из env, иначе ws://<host запроса>:7880, иначе localhost."""
     env_url = os.getenv("LIVEKIT_URL", "").strip()
     if env_url:
         return env_url
@@ -42,6 +42,30 @@ def _default_livekit_ws_url(request: web.Request) -> str:
     except Exception:
         pass
     return "ws://127.0.0.1:7880"
+
+
+def _default_livekit_ws_url(request: web.Request) -> str:
+    return livekit_public_ws_url(request)
+
+
+def helper_public_base_url(request: web.Request) -> str:
+    """Базовый URL этого helper (как к нему обратился клиент), без пути."""
+    try:
+        return str(request.url.origin()).rstrip("/")
+    except Exception:
+        return "http://127.0.0.1:8000"
+
+
+async def client_discovery(request: web.Request) -> web.Response:
+    """Для GUI: отдать рекомендуемые URL (из env на сервере + host запроса)."""
+    room = os.getenv("LIVEKIT_DEFAULT_ROOM", "audio-room").strip() or "audio-room"
+    return web.json_response(
+        {
+            "livekit_url": livekit_public_ws_url(request),
+            "helper_url": helper_public_base_url(request),
+            "default_room": room,
+        }
+    )
 
 
 async def index(request: web.Request) -> web.Response:
@@ -168,6 +192,7 @@ def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/client/discovery", client_discovery)
     app.router.add_get("/livekit/token", livekit_token)
     app.router.add_get("/livekit/publisher_token", livekit_publisher_token)
     return app

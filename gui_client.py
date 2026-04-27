@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import ipaddress
 import json
 import shutil
 import subprocess
@@ -8,7 +9,7 @@ import threading
 import time
 import os
 import re
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from dataclasses import dataclass
@@ -39,8 +40,131 @@ load_env_files(
 )
 load_env_files(("livekit.env", ".env"), override_existing=True)
 ENABLE_LEGACY_TRANSPORT = os.getenv("ENABLE_LEGACY_TRANSPORT", "0") == "1"
-DEFAULT_HELPER_URL = os.getenv("HELPER_URL", "http://127.0.0.1:8000")
-DEFAULT_LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
+# Порты по умолчанию, если в поле «Сервер» указан только IP/hostname
+DEFAULT_LIVEKIT_PORT = int(os.getenv("DEFAULT_LIVEKIT_PORT", "7880"))
+DEFAULT_HELPER_PORT = int(os.getenv("DEFAULT_HELPER_PORT", "8000"))
+# Legacy MP3 WebSocket (транспорт «не LiveKit») — если задан только хост
+DEFAULT_LEGACY_WS_PORT = int(os.getenv("DEFAULT_LEGACY_WS_PORT", "8765"))
+
+
+def _host_for_url(host: str) -> str:
+    """IPv6 в URL должен быть в квадратных скобках."""
+    try:
+        ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv6Address):
+            return f"[{ip.compressed}]"
+    except ValueError:
+        pass
+    return host
+
+
+def _default_gui_server_field() -> str:
+    h = os.getenv("GUI_DEFAULT_SERVER", "").strip()
+    if h:
+        return h
+    for u in (os.getenv("HELPER_URL", ""), os.getenv("LIVEKIT_URL", "")):
+        u = u.strip()
+        if not u:
+            continue
+        try:
+            p = urlparse(u)
+            if p.hostname:
+                return p.hostname
+        except Exception:
+            pass
+    return "127.0.0.1"
+
+
+def fetch_client_discovery(helper_url: str) -> Optional[dict]:
+    url = f"{helper_url.rstrip('/')}/client/discovery"
+    try:
+        with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=5.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def resolve_livekit_endpoints(user_text: str) -> Tuple[str, str]:
+    """
+    Разбор поля «Сервер» в (LiveKit ws/wss URL, helper http(s) URL).
+    Допустимо: только IP/hostname, http(s)://… (helper), ws(s)://… (LiveKit).
+    """
+    t = user_text.strip()
+    if not t:
+        raise ValueError("Укажите сервер (IP, hostname или URL).")
+    if t.startswith("ttp://"):
+        t = "http://" + t[6:]
+    low = t.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        p = urlparse(t)
+        h = p.hostname
+        if not h:
+            raise ValueError("Некорректный HTTP(S) URL.")
+        helper = t.split("?", 1)[0].rstrip("/")
+        lk_scheme = "wss" if p.scheme == "https" else "ws"
+        livekit = f"{lk_scheme}://{h}:{DEFAULT_LIVEKIT_PORT}"
+        return (livekit, helper)
+    if low.startswith("ws://") or low.startswith("wss://"):
+        p = urlparse(t)
+        h = p.hostname
+        if not h:
+            raise ValueError("Некорректный WebSocket URL.")
+        livekit = t.split("?", 1)[0].rstrip("/")
+        if p.scheme == "wss":
+            helper = f"https://{h}:{DEFAULT_HELPER_PORT}"
+        else:
+            helper = f"http://{h}:{DEFAULT_HELPER_PORT}"
+        return (livekit, helper)
+    if "://" in t:
+        raise ValueError("Ожидался IP/hostname или URL с http(s) или ws(s).")
+    # host или host:port (IPv4; IPv6 — в квадратных скобках)
+    if t.count(":") == 1 and not t.startswith("["):
+        a, b = t.rsplit(":", 1)
+        if b.isdigit():
+            port = int(b)
+            host = _host_for_url(a.strip("[]"))
+            if port == DEFAULT_LIVEKIT_PORT:
+                return (
+                    f"ws://{host}:{port}",
+                    f"http://{host}:{DEFAULT_HELPER_PORT}",
+                )
+            return (
+                f"ws://{host}:{DEFAULT_LIVEKIT_PORT}",
+                f"http://{host}:{port}",
+            )
+    host = _host_for_url(t.strip("[]"))
+    return (
+        f"ws://{host}:{DEFAULT_LIVEKIT_PORT}",
+        f"http://{host}:{DEFAULT_HELPER_PORT}",
+    )
+
+
+def resolve_legacy_websocket_url(user_text: str) -> str:
+    """URL WebSocket для legacy-транспорта."""
+    t = user_text.strip()
+    if not t:
+        raise ValueError("Укажите сервер (IP, hostname или ws://…).")
+    low = t.lower()
+    if low.startswith("ws://") or low.startswith("wss://"):
+        return t.split("?", 1)[0].rstrip("/")
+    if "://" in t:
+        raise ValueError("Для legacy укажите ws://… или IP/hostname.")
+    if t.count(":") == 1 and not t.startswith("["):
+        a, b = t.rsplit(":", 1)
+        if b.isdigit():
+            return f"ws://{_host_for_url(a.strip('[]'))}:{b}"
+    host = _host_for_url(t.strip("[]"))
+    return f"ws://{host}:{DEFAULT_LEGACY_WS_PORT}"
+
+
+def livekit_urls_with_discovery(user_text: str) -> Tuple[str, str]:
+    """Как resolve_livekit_endpoints, затем при успехе — подстановка с helper /client/discovery."""
+    lk, helper = resolve_livekit_endpoints(user_text)
+    data = fetch_client_discovery(helper)
+    if data:
+        lk = (data.get("livekit_url") or lk).strip() or lk
+        helper = (data.get("helper_url") or helper).strip() or helper
+    return (lk, helper)
 DEFAULT_LIVEKIT_ROOM = os.getenv("LIVEKIT_DEFAULT_ROOM", "audio-room")
 DEFAULT_LIVEKIT_IDENTITY = os.getenv("LIVEKIT_PUBLISHER_IDENTITY", "publisher-local")
 
@@ -512,7 +636,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Audio Streamer (LiveKit)")
-        self.geometry("860x470")
+        self.geometry("860x530")
         self.resizable(False, False)
 
         self.legacy_client = StreamClient(self.on_state_update)
@@ -530,71 +654,73 @@ class App(tk.Tk):
         self.combo_transport.grid(row=0, column=1, sticky="w", **pad)
         self.combo_transport.bind("<<ComboboxSelected>>", lambda e: self.on_transport_changed())
 
-        # Server URL
-        self.var_server = tk.StringVar(value=DEFAULT_LIVEKIT_URL)
-        ttk.Label(frm, text="LiveKit URL:").grid(row=1, column=0, sticky="w", **pad)
+        # Сервер: IP/hostname (порты 8000 и 7880), полный URL helper или ws(s) LiveKit
+        self.var_server = tk.StringVar(value=_default_gui_server_field())
+        ttk.Label(frm, text="Сервер:").grid(row=1, column=0, sticky="nw", **pad)
         self.entry_server = ttk.Entry(frm, textvariable=self.var_server, width=55)
         self.entry_server.grid(row=1, column=1, sticky="we", **pad, columnspan=3)
+        ttk.Label(
+            frm,
+            text="Достаточно указать IP — http://…:8000 и ws://…:7880 подставятся; при старте "
+            "запрашивается /client/discovery у helper (как на сервере в livekit.env).",
+            wraplength=640,
+            foreground="#555",
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(0, 2), columnspan=3)
 
-        ttk.Label(frm, text="Комната:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Комната:").grid(row=3, column=0, sticky="w", **pad)
         self.var_room = tk.StringVar(value=DEFAULT_LIVEKIT_ROOM)
-        ttk.Entry(frm, textvariable=self.var_room, width=20).grid(row=2, column=1, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_room, width=20).grid(row=3, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Identity:").grid(row=2, column=2, sticky="e", **pad)
+        ttk.Label(frm, text="Identity:").grid(row=3, column=2, sticky="e", **pad)
         self.var_identity = tk.StringVar(value=DEFAULT_LIVEKIT_IDENTITY)
-        ttk.Entry(frm, textvariable=self.var_identity, width=20).grid(row=2, column=3, sticky="we", **pad)
+        ttk.Entry(frm, textvariable=self.var_identity, width=20).grid(row=3, column=3, sticky="we", **pad)
 
-        ttk.Label(frm, text="Helper URL:").grid(row=3, column=0, sticky="w", **pad)
-        self.var_helper_url = tk.StringVar(value=DEFAULT_HELPER_URL)
-        self.entry_helper_url = ttk.Entry(frm, textvariable=self.var_helper_url, width=20)
-        self.entry_helper_url.grid(row=3, column=1, sticky="w", **pad)
-
-        ttk.Label(frm, text="Pairing secret:").grid(row=3, column=2, sticky="e", **pad)
+        ttk.Label(frm, text="Pairing secret:").grid(row=4, column=0, sticky="w", **pad)
         self.var_pairing_secret = tk.StringVar(value=os.getenv("LIVEKIT_PAIRING_SECRET", ""))
-        self.entry_pairing_secret = ttk.Entry(frm, textvariable=self.var_pairing_secret, width=20, show="*")
-        self.entry_pairing_secret.grid(row=3, column=3, sticky="we", **pad)
+        self.entry_pairing_secret = ttk.Entry(frm, textvariable=self.var_pairing_secret, width=50, show="*")
+        self.entry_pairing_secret.grid(row=4, column=1, sticky="we", **pad, columnspan=3)
 
         # Device
-        ttk.Label(frm, text="Источник аудио:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Источник аудио:").grid(row=5, column=0, sticky="w", **pad)
         self.var_device = tk.StringVar()
         self.combo_device = ttk.Combobox(frm, state="readonly", width=55)
-        self.combo_device.grid(row=4, column=1, sticky="we", **pad, columnspan=3)
+        self.combo_device.grid(row=5, column=1, sticky="we", **pad, columnspan=3)
 
         # Create/Delete virtual device (PulseAudio only)
         self.btn_create = ttk.Button(frm, text="Создать виртуальное устройство", command=self.on_create_vdev)
         self.btn_delete = ttk.Button(frm, text="Удалить виртуальное устройство", command=self.on_delete_vdev)
         self.btn_refresh = ttk.Button(frm, text="Обновить источники", command=self.on_refresh_devices)
-        self.btn_create.grid(row=5, column=1, sticky="we", **pad)
-        self.btn_delete.grid(row=5, column=2, sticky="we", **pad)
-        self.btn_refresh.grid(row=5, column=3, sticky="we", **pad)
+        self.btn_create.grid(row=6, column=1, sticky="we", **pad)
+        self.btn_delete.grid(row=6, column=2, sticky="we", **pad)
+        self.btn_refresh.grid(row=6, column=3, sticky="we", **pad)
 
         # Channels / Rate / Bitrate
-        ttk.Label(frm, text="Каналы:").grid(row=6, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Каналы:").grid(row=7, column=0, sticky="w", **pad)
         self.var_channels = tk.IntVar(value=2)
-        ttk.Spinbox(frm, from_=1, to=2, textvariable=self.var_channels, width=5).grid(row=6, column=1, sticky="w", **pad)
+        ttk.Spinbox(frm, from_=1, to=2, textvariable=self.var_channels, width=5).grid(row=7, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Частота, Гц:").grid(row=7, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Частота, Гц:").grid(row=8, column=0, sticky="w", **pad)
         self.var_rate = tk.IntVar(value=48000)
         ttk.Spinbox(frm, from_=16000, to=96000, increment=1000, textvariable=self.var_rate, width=9)\
-            .grid(row=7, column=1, sticky="w", **pad)
+            .grid(row=8, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Битрейт MP3, кбит/с (legacy):").grid(row=8, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Битрейт MP3, кбит/с (legacy):").grid(row=9, column=0, sticky="w", **pad)
         self.var_bitrate = tk.IntVar(value=128)
         self.spin_bitrate = ttk.Spinbox(frm, from_=64, to=320, increment=16, textvariable=self.var_bitrate, width=9)
-        self.spin_bitrate.grid(row=8, column=1, sticky="w", **pad)
+        self.spin_bitrate.grid(row=9, column=1, sticky="w", **pad)
 
         # Status
         self.lbl_status = ttk.Label(frm, text="Статус: offline", foreground="#b00")
-        self.lbl_status.grid(row=9, column=0, sticky="w", **pad, columnspan=4)
+        self.lbl_status.grid(row=10, column=0, sticky="w", **pad, columnspan=4)
 
         self.lbl_extra = ttk.Label(frm, text="LiveKit room: - | Connected: no", foreground="#333")
-        self.lbl_extra.grid(row=10, column=0, sticky="w", **pad, columnspan=4)
+        self.lbl_extra.grid(row=11, column=0, sticky="w", **pad, columnspan=4)
 
         # Buttons
         self.btn_start = ttk.Button(frm, text="Старт", command=self.on_start)
         self.btn_stop = ttk.Button(frm, text="Стоп", command=self.on_stop, state="disabled")
-        self.btn_start.grid(row=11, column=2, **pad, sticky="we")
-        self.btn_stop.grid(row=11, column=3, **pad, sticky="we")
+        self.btn_start.grid(row=12, column=2, **pad, sticky="we")
+        self.btn_stop.grid(row=12, column=3, **pad, sticky="we")
 
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(2, weight=1)
@@ -618,7 +744,6 @@ class App(tk.Tk):
 
     def on_transport_changed(self):
         is_livekit = self.var_transport.get() == "LiveKit (native)"
-        self.entry_helper_url.config(state="normal" if is_livekit else "disabled")
         self.entry_pairing_secret.config(state="normal" if is_livekit else "disabled")
         self.spin_bitrate.config(state="disabled" if is_livekit else "normal")
         self.btn_create.config(state="disabled" if is_livekit else "normal")
@@ -650,9 +775,9 @@ class App(tk.Tk):
         self.on_refresh_devices()
 
     def on_start(self):
-        server = self.var_server.get().strip()
-        if not server:
-            messagebox.showerror("Ошибка", "Укажите URL сервера.")
+        raw_server = self.var_server.get().strip()
+        if not raw_server:
+            messagebox.showerror("Ошибка", "Укажите сервер (IP, hostname или URL).")
             return
 
         if self.var_transport.get() == "LiveKit (native)":
@@ -660,21 +785,19 @@ class App(tk.Tk):
             if not self.input_devices:
                 messagebox.showerror("Ошибка", "Не найдено устройств ввода.")
                 return
-            helper_url = self.var_helper_url.get().strip()
-            if helper_url.startswith("ttp://"):
-                helper_url = "http://" + helper_url[6:]
             pairing_secret = self.var_pairing_secret.get().strip()
             room = self.var_room.get().strip()
             identity = self.var_identity.get().strip()
-            if not (helper_url and pairing_secret and room and identity):
+            if not (pairing_secret and room and identity):
                 messagebox.showerror(
                     "Ошибка",
-                    "Заполните helper URL, pairing secret, комнату и identity.\n\n"
+                    "Заполните pairing secret, комнату и identity.\n\n"
                     "Pairing secret должен совпадать с LIVEKIT_PAIRING_SECRET на машине helper "
                     "(файл livekit.env). При старте server.py в консоли выводится блок «параметры для клиента».",
                 )
                 return
             try:
+                server_lk, helper_url = livekit_urls_with_discovery(raw_server)
                 token = request_publisher_token(
                     helper_url=helper_url,
                     room=room,
@@ -683,7 +806,7 @@ class App(tk.Tk):
                 )
                 device = self.input_devices[dev_idx] if (0 <= dev_idx < len(self.input_devices)) else self.input_devices[0]
                 self.livekit_client.start(
-                    server_url=server,
+                    server_url=server_lk,
                     token=token,
                     device_id=device.device_id,
                     channels=int(self.var_channels.get()),
@@ -698,6 +821,7 @@ class App(tk.Tk):
                 messagebox.showerror("Ошибка", "ffmpeg не найден. Установите пакет ffmpeg.")
                 return
             try:
+                server = resolve_legacy_websocket_url(raw_server)
                 self.legacy_client.start(
                     server_url=server,
                     backend="pulse",
