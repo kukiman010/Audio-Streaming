@@ -6,12 +6,12 @@ cd "${ROOT_DIR}"
 
 require_supported_python() {
   local major minor
-  major="$(python3 -c 'import sys; print(sys.version_info[0])')"
-  minor="$(python3 -c 'import sys; print(sys.version_info[1])')"
+  major="$(python -c 'import sys; print(sys.version_info[0])')"
+  minor="$(python -c 'import sys; print(sys.version_info[1])')"
 
   if (( major < 3 || (major == 3 && minor < 9) )); then
     echo "Error: Python 3.9+ is required for the livekit package."
-    echo "Current python3 version: $(python3 --version 2>&1)"
+    echo "Current python3 version: $(python --version 2>&1)"
     echo "Install Python 3.9+ and recreate .venv:"
     echo "  rm -rf .venv && python3 -m venv .venv"
     exit 1
@@ -21,7 +21,7 @@ require_supported_python() {
 ensure_python_env() {
   if [[ ! -d ".venv" ]]; then
     echo "Creating Python virtualenv..."
-    python3 -m venv .venv
+    python -m venv .venv
   fi
 
   # shellcheck disable=SC1091
