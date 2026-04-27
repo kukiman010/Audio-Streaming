@@ -11,9 +11,9 @@ require_supported_python() {
 
   if (( major < 3 || (major == 3 && minor < 9) )); then
     echo "Error: Python 3.9+ is required for the livekit package."
-    echo "Current python3 version: $(python --version 2>&1)"
+    echo "Current python version: $(python --version 2>&1)"
     echo "Install Python 3.9+ and recreate .venv:"
-    echo "  rm -rf .venv && python3 -m venv .venv"
+    echo "  rm -rf .venv && python -m venv .venv"
     exit 1
   fi
 }
@@ -37,7 +37,7 @@ ensure_python_env() {
 if [[ ! -f "livekit.env" || ! -f "deploy/livekit/livekit.yaml" || ! -f "deploy/livekit/turnserver.conf" ]]; then
   echo "First run setup..."
   require_supported_python
-  python3 "setup_livekit.py"
+  python "setup_livekit.py"
 fi
 
 require_supported_python
