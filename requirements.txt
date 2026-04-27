@@ -4,4 +4,7 @@ qrcode==7.4.2
 pydantic==2.8.2
 aiohttp
 psutil
+livekit
+livekit-api
+sounddevice
 

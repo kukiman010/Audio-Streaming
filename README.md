@@ -1,9 +1,10 @@
-# Audio Streaming (Ogg Opus) — Debian 12, Python
+# Audio Streaming (LiveKit) — Debian 12 + Windows/Linux client
 
 Компоненты:
-- Сервер FastAPI: прием ingest (HTTP POST chunked) и отдача live аудио (audio/ogg) слушателям, веб-страница /listen/{id}, API.
-- Клиент-стример (Tkinter): выбор устройства, старт/стоп, статус, ссылка и QR-код.
-- Формат: Ogg Opus (низкая задержка, хорошее качество).
+- `gui_client.py` — Tkinter-клиент с нативным publish в LiveKit (без ffmpeg-транспорта).
+- `server.py` — helper service: web-viewer + endpoint для выдачи LiveKit токенов.
+- `deploy/livekit/` — self-host инфраструктура LiveKit (Docker Compose + примеры конфигов).
+- `audio_devices.py` — кроссплатформенное перечисление input-устройств (Linux/Windows).
 
 ## Установка (Debian 12)
 
@@ -44,24 +45,51 @@ python3 streamer.py
 
 В окне задайте адрес сервера (например, http://127.0.0.1:8000), выберите входное устройство и нажмите “Начать стрим”.
 
-## Как это работает
+## Быстрый старт (миграция на LiveKit)
 
-- При “Старт” клиент вызывает POST /api/start. Сервер создает stream_id и ingest ключ, формирует уникальную ссылку /listen/{id}, а также QR-код.
-- Клиент запускает ffmpeg, который читает PCM из stdin и кодирует в Ogg Opus (96 kbps, lowdelay, 20 ms), затем POST’ит поток на /ingest/{id}?key=...
-- Сервер одновременно:
-  - кеширует заголовки Opus (OpusHead/OpusTags) и небольшой преролл,
-  - транслирует входящие чанки всем слушателям.
-- Слушатель открывает /listen/{id}, жмет “Начать прослушивание”, браузер воспроизводит /stream/{id} с Content-Type: audio/ogg.
+1) Установите зависимости:
+```bash
+python -m pip install -r requirements.txt
+python -m pip install livekit-api
+```
+
+2) Разверните LiveKit self-host:
+- Используйте `deploy/livekit/docker-compose.yml`
+- Скопируйте:
+  - `deploy/livekit/livekit.yaml.example -> deploy/livekit/livekit.yaml`
+  - `deploy/livekit/turnserver.conf.example -> deploy/livekit/turnserver.conf`
+- Заполните секреты и домен, затем поднимите сервисы.
+
+3) Задайте переменные окружения для token helper:
+```bash
+export LIVEKIT_API_KEY=devkey
+export LIVEKIT_API_SECRET=replace_with_long_secret
+```
+
+4) Запустите helper web:
+```bash
+python server.py --host 0.0.0.0 --port 8000
+```
+
+5) Запустите клиент:
+```bash
+python gui_client.py
+```
+
+6) Проверка smoke/perf:
+```bash
+python performance_validation.py
+```
 
 ## Советы по задержке и качеству
 
-- Уменьшайте битрейт (-b:a 64k) для экономии канала или увеличивайте до 128k для музыки.
-- Блок 20 мс (frame_duration 20) — хороший баланс между задержкой и устойчивостью.
-- Если аудио щелкает: увеличьте BLOCKSIZE в streamer.py до 1920 (40 мс).
+- Используйте UDP и рабочий TURN (coturn) для клиентов за NAT.
+- Начинайте с `48000 Hz`, `1-2` канала; увеличивайте только при необходимости.
+- Для production задавайте длинные секреты (`LIVEKIT_API_SECRET` 32+ байт).
 
-## Тестирование локально
+## Локальное тестирование
 
-- Запустите сервер (uvicorn).
-- Запустите клиент, укажите http://127.0.0.1:8000 и стартуйте стрим.
-- Откройте в браузере ссылку из клиента — слушайте.
+- Запустите `server.py`.
+- В браузере откройте `/` и подключитесь к room через встроенный LiveKit viewer.
+- Запустите `gui_client.py` и публикуйте аудио в ту же комнату.
 

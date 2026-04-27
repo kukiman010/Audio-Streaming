@@ -13,6 +13,9 @@ from typing import List, Tuple, Optional, Callable
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+from audio_devices import list_input_devices, AudioInputDevice
+from livekit_client import LiveKitStreamClient, LiveKitState
+from livekit_token import build_token
 
 try:
     from aiohttp import ClientSession, WSMsgType, ClientConnectorError, WSServerHandshakeError
@@ -26,6 +29,7 @@ PACTL_BIN = shutil.which("pactl") or "/usr/bin/pactl"
 
 # Префикс для своих виртуальных устройств PulseAudio (как в audio_recorder.py)
 PREFIX = "MYAPP_"
+ENABLE_LEGACY_TRANSPORT = os.getenv("ENABLE_LEGACY_TRANSPORT", "0") == "1"
 
 # ---------------- Утилиты обнаружения устройств ----------------
 
@@ -424,87 +428,136 @@ class contextlib_suppress:
     def __enter__(self): return None
     def __exit__(self, exc_type, exc, tb): return exc_type and issubclass(exc_type, self.exc)
 
+
+class LiveKitClientAdapter:
+    def __init__(self, ui_callback: Callable[[LiveKitState], None]):
+        self._client = LiveKitStreamClient(ui_callback)
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="livekit-loop")
+        self._thread.start()
+
+    @property
+    def state(self) -> LiveKitState:
+        return self._client.state
+
+    def start(
+        self,
+        server_url: str,
+        token: str,
+        device_id: Optional[str],
+        channels: int,
+        sample_rate: int,
+    ) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._client.start(
+                server_url=server_url,
+                token=token,
+                device_id=device_id,
+                channels=channels,
+                sample_rate=sample_rate,
+            ),
+            self._loop,
+        )
+
+    def stop(self) -> None:
+        asyncio.run_coroutine_threadsafe(self._client.stop(), self._loop)
+
 # ---------------- Tkinter GUI ----------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Simple Audio Streamer (MP3 over WebSocket)")
-        self.geometry("740x360")
+        self.title("Audio Streamer (LiveKit)")
+        self.geometry("860x470")
         self.resizable(False, False)
 
-        self.client = StreamClient(self.on_state_update)
-
-        # Списки устройств по бэкендам
-        self.backend_values = ["PulseAudio", "ALSA"]
-        self.pulse_sources: List[Tuple[str, str]] = []
-        self.alsa_devices: List[Tuple[str, str]] = []
+        self.legacy_client = StreamClient(self.on_state_update)
+        self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update)
+        self.transport_values = ["LiveKit (native)"] + (["Legacy WS+FFmpeg"] if ENABLE_LEGACY_TRANSPORT else [])
+        self.input_devices: List[AudioInputDevice] = []
 
         pad = {"padx": 8, "pady": 6}
         frm = ttk.Frame(self)
         frm.pack(fill="both", expand=True)
 
-        # Server URL
-        ttk.Label(frm, text="Сервер (WebSocket):").grid(row=0, column=0, sticky="w", **pad)
-        self.var_server = tk.StringVar(value="ws://127.0.0.1:8000/uplink")
-        ttk.Entry(frm, textvariable=self.var_server, width=55).grid(row=0, column=1, sticky="we", **pad, columnspan=3)
+        ttk.Label(frm, text="Транспорт:").grid(row=0, column=0, sticky="w", **pad)
+        self.var_transport = tk.StringVar(value=self.transport_values[0])
+        self.combo_transport = ttk.Combobox(frm, state="readonly", width=24, textvariable=self.var_transport, values=self.transport_values)
+        self.combo_transport.grid(row=0, column=1, sticky="w", **pad)
+        self.combo_transport.bind("<<ComboboxSelected>>", lambda e: self.on_transport_changed())
 
-        # Backend
-        ttk.Label(frm, text="Бэкенд аудио:").grid(row=1, column=0, sticky="w", **pad)
-        self.var_backend = tk.StringVar(value="PulseAudio")
-        self.combo_backend = ttk.Combobox(frm, state="readonly", width=20, textvariable=self.var_backend,
-                                          values=self.backend_values)
-        self.combo_backend.grid(row=1, column=1, sticky="w", **pad)
-        self.combo_backend.bind("<<ComboboxSelected>>", lambda e: self.on_backend_changed())
+        # Server URL
+        self.var_server = tk.StringVar(value="ws://127.0.0.1:7880")
+        ttk.Label(frm, text="LiveKit URL:").grid(row=1, column=0, sticky="w", **pad)
+        self.entry_server = ttk.Entry(frm, textvariable=self.var_server, width=55)
+        self.entry_server.grid(row=1, column=1, sticky="we", **pad, columnspan=3)
+
+        ttk.Label(frm, text="Комната:").grid(row=2, column=0, sticky="w", **pad)
+        self.var_room = tk.StringVar(value="audio-room")
+        ttk.Entry(frm, textvariable=self.var_room, width=20).grid(row=2, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="Identity:").grid(row=2, column=2, sticky="e", **pad)
+        self.var_identity = tk.StringVar(value="publisher-local")
+        ttk.Entry(frm, textvariable=self.var_identity, width=20).grid(row=2, column=3, sticky="we", **pad)
+
+        ttk.Label(frm, text="API key:").grid(row=3, column=0, sticky="w", **pad)
+        self.var_api_key = tk.StringVar(value=os.getenv("LIVEKIT_API_KEY", "devkey"))
+        self.entry_api_key = ttk.Entry(frm, textvariable=self.var_api_key, width=20)
+        self.entry_api_key.grid(row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="API secret:").grid(row=3, column=2, sticky="e", **pad)
+        self.var_api_secret = tk.StringVar(value=os.getenv("LIVEKIT_API_SECRET", ""))
+        self.entry_api_secret = ttk.Entry(frm, textvariable=self.var_api_secret, width=20, show="*")
+        self.entry_api_secret.grid(row=3, column=3, sticky="we", **pad)
 
         # Device
-        ttk.Label(frm, text="Источник аудио:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Источник аудио:").grid(row=4, column=0, sticky="w", **pad)
         self.var_device = tk.StringVar()
         self.combo_device = ttk.Combobox(frm, state="readonly", width=55)
-        self.combo_device.grid(row=2, column=1, sticky="we", **pad, columnspan=3)
+        self.combo_device.grid(row=4, column=1, sticky="we", **pad, columnspan=3)
 
         # Create/Delete virtual device (PulseAudio only)
         self.btn_create = ttk.Button(frm, text="Создать виртуальное устройство", command=self.on_create_vdev)
         self.btn_delete = ttk.Button(frm, text="Удалить виртуальное устройство", command=self.on_delete_vdev)
         self.btn_refresh = ttk.Button(frm, text="Обновить источники", command=self.on_refresh_devices)
-        self.btn_create.grid(row=3, column=1, sticky="we", **pad)
-        self.btn_delete.grid(row=3, column=2, sticky="we", **pad)
-        self.btn_refresh.grid(row=3, column=3, sticky="we", **pad)
+        self.btn_create.grid(row=5, column=1, sticky="we", **pad)
+        self.btn_delete.grid(row=5, column=2, sticky="we", **pad)
+        self.btn_refresh.grid(row=5, column=3, sticky="we", **pad)
 
         # Channels / Rate / Bitrate
-        ttk.Label(frm, text="Каналы:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Каналы:").grid(row=6, column=0, sticky="w", **pad)
         self.var_channels = tk.IntVar(value=2)
-        ttk.Spinbox(frm, from_=1, to=2, textvariable=self.var_channels, width=5).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Spinbox(frm, from_=1, to=2, textvariable=self.var_channels, width=5).grid(row=6, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Частота, Гц:").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Частота, Гц:").grid(row=7, column=0, sticky="w", **pad)
         self.var_rate = tk.IntVar(value=48000)
         ttk.Spinbox(frm, from_=16000, to=96000, increment=1000, textvariable=self.var_rate, width=9)\
-            .grid(row=5, column=1, sticky="w", **pad)
+            .grid(row=7, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Битрейт MP3, кбит/с:").grid(row=6, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Битрейт MP3, кбит/с (legacy):").grid(row=8, column=0, sticky="w", **pad)
         self.var_bitrate = tk.IntVar(value=128)
-        ttk.Spinbox(frm, from_=64, to=320, increment=16, textvariable=self.var_bitrate, width=9)\
-            .grid(row=6, column=1, sticky="w", **pad)
+        self.spin_bitrate = ttk.Spinbox(frm, from_=64, to=320, increment=16, textvariable=self.var_bitrate, width=9)
+        self.spin_bitrate.grid(row=8, column=1, sticky="w", **pad)
 
         # Status
         self.lbl_status = ttk.Label(frm, text="Статус: offline", foreground="#b00")
-        self.lbl_status.grid(row=7, column=0, sticky="w", **pad, columnspan=4)
+        self.lbl_status.grid(row=9, column=0, sticky="w", **pad, columnspan=4)
 
-        self.lbl_extra = ttk.Label(frm, text="Слушателей: 0 | Отправлено: 0.0 KiB | Аптайм: 0 c", foreground="#333")
-        self.lbl_extra.grid(row=8, column=0, sticky="w", **pad, columnspan=4)
+        self.lbl_extra = ttk.Label(frm, text="LiveKit room: - | Connected: no", foreground="#333")
+        self.lbl_extra.grid(row=10, column=0, sticky="w", **pad, columnspan=4)
 
         # Buttons
         self.btn_start = ttk.Button(frm, text="Старт", command=self.on_start)
         self.btn_stop = ttk.Button(frm, text="Стоп", command=self.on_stop, state="disabled")
-        self.btn_start.grid(row=9, column=2, **pad, sticky="we")
-        self.btn_stop.grid(row=9, column=3, **pad, sticky="we")
+        self.btn_start.grid(row=11, column=2, **pad, sticky="we")
+        self.btn_stop.grid(row=11, column=3, **pad, sticky="we")
 
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(2, weight=1)
         frm.columnconfigure(3, weight=1)
 
         # Initial populate
-        self.on_backend_changed()
+        self.on_transport_changed()
 
         # Periodic UI updater
         self.after(1000, self._tick)
@@ -513,30 +566,31 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _tick(self):
-        st = self.client.state
-        self._render_state(st)
+        if self.var_transport.get() == "LiveKit (native)":
+            self._render_livekit_state(self.livekit_client.state)
+        else:
+            self._render_state(self.legacy_client.state)
         self.after(1000, self._tick)
 
-    def on_backend_changed(self):
-        backend = self.var_backend.get()
-        # В PulseAudio — активируем кнопки создания/удаления; в ALSA — выключаем
-        pulse_mode = (backend == "PulseAudio")
-        self.btn_create.config(state=("normal" if pulse_mode else "disabled"))
-        self.btn_delete.config(state=("normal" if pulse_mode else "disabled"))
-        # Обновить список источников
+    def on_transport_changed(self):
+        is_livekit = self.var_transport.get() == "LiveKit (native)"
+        self.entry_api_key.config(state="normal" if is_livekit else "disabled")
+        self.entry_api_secret.config(state="normal" if is_livekit else "disabled")
+        self.spin_bitrate.config(state="disabled" if is_livekit else "normal")
+        self.btn_create.config(state="disabled" if is_livekit else "normal")
+        self.btn_delete.config(state="disabled" if is_livekit else "normal")
         self.on_refresh_devices()
 
     def on_refresh_devices(self):
-        backend = self.var_backend.get()
-        if backend == "PulseAudio":
-            self.pulse_sources = list_pulse_sources()
-            values = [f"{i} — {l}" for i, l in self.pulse_sources]
+        if self.var_transport.get() == "LiveKit (native)":
+            self.input_devices = list_input_devices()
+            values = [f"{d.device_id} — {d.name} [{d.backend}]" for d in self.input_devices]
             self.combo_device["values"] = values
             if values:
                 self.combo_device.current(0)
         else:
-            self.alsa_devices = list_alsa_devices()
-            values = [f"{i} — {l}" for i, l in self.alsa_devices]
+            self.pulse_sources = list_pulse_sources()
+            values = [f"{i} — {l}" for i, l in self.pulse_sources]
             self.combo_device["values"] = values
             if values:
                 self.combo_device.current(0)
@@ -552,54 +606,97 @@ class App(tk.Tk):
         self.on_refresh_devices()
 
     def on_start(self):
-        if not FFMPEG_BIN:
-            messagebox.showerror("Ошибка", "ffmpeg не найден. Установите пакет ffmpeg.")
-            return
         server = self.var_server.get().strip()
         if not server:
-            messagebox.showerror("Ошибка", "Укажите URL сервера (ws://.../uplink).")
+            messagebox.showerror("Ошибка", "Укажите URL сервера.")
             return
 
-        backend = self.var_backend.get()
-        dev_idx = self.combo_device.current()
-        device = None
-        if backend == "PulseAudio":
-            if not self.pulse_sources:
-                messagebox.showerror("Ошибка", "Нет источников PulseAudio. Убедитесь, что запущен PulseAudio/PipeWire и установлен pactl.")
+        if self.var_transport.get() == "LiveKit (native)":
+            dev_idx = self.combo_device.current()
+            if not self.input_devices:
+                messagebox.showerror("Ошибка", "Не найдено устройств ввода.")
                 return
-            device = self.pulse_sources[dev_idx][0] if (0 <= dev_idx < len(self.pulse_sources)) else self.pulse_sources[0][0]
-            backend_key = "pulse"
+            api_key = self.var_api_key.get().strip()
+            api_secret = self.var_api_secret.get().strip()
+            room = self.var_room.get().strip()
+            identity = self.var_identity.get().strip()
+            if not (api_key and api_secret and room and identity):
+                messagebox.showerror("Ошибка", "Заполните API key/secret, room и identity.")
+                return
+            try:
+                token = build_token(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    room=room,
+                    identity=identity,
+                    can_publish=True,
+                    can_subscribe=True,
+                )
+                device = self.input_devices[dev_idx] if (0 <= dev_idx < len(self.input_devices)) else self.input_devices[0]
+                self.livekit_client.start(
+                    server_url=server,
+                    token=token,
+                    device_id=device.device_id,
+                    channels=int(self.var_channels.get()),
+                    sample_rate=int(self.var_rate.get()),
+                )
+                self.btn_start.config(state="disabled")
+                self.btn_stop.config(state="normal")
+            except Exception as e:
+                messagebox.showerror("Ошибка запуска", str(e))
         else:
-            if not self.alsa_devices:
-                # fallback
-                self.alsa_devices = [("default", "default")]
-            device = self.alsa_devices[dev_idx][0] if (0 <= dev_idx < len(self.alsa_devices)) else "default"
-            backend_key = "alsa"
-
-        try:
-            self.client.start(
-                server_url=server,
-                backend=backend_key,
-                device=device,
-                channels=int(self.var_channels.get()),
-                rate=int(self.var_rate.get()),
-                bitrate=int(self.var_bitrate.get()),
-                chunk_size=4096
-                # chunk_size=8196
-            )
-            self.btn_start.config(state="disabled")
-            self.btn_stop.config(state="normal")
-        except Exception as e:
-            messagebox.showerror("Ошибка запуска", str(e))
+            if not FFMPEG_BIN:
+                messagebox.showerror("Ошибка", "ffmpeg не найден. Установите пакет ffmpeg.")
+                return
+            try:
+                self.legacy_client.start(
+                    server_url=server,
+                    backend="pulse",
+                    device=self.pulse_sources[0][0] if self.pulse_sources else "default",
+                    channels=int(self.var_channels.get()),
+                    rate=int(self.var_rate.get()),
+                    bitrate=int(self.var_bitrate.get()),
+                    chunk_size=4096,
+                )
+                self.btn_start.config(state="disabled")
+                self.btn_stop.config(state="normal")
+            except Exception as e:
+                messagebox.showerror("Ошибка запуска", str(e))
 
     def on_stop(self):
         try:
-            self.client.stop()
+            if self.var_transport.get() == "LiveKit (native)":
+                self.livekit_client.stop()
+            else:
+                self.legacy_client.stop()
         except Exception as e:
             messagebox.showwarning("Внимание", f"Не удалось остановить: {e}")
         finally:
             self.btn_start.config(state="normal")
             self.btn_stop.config(state="disabled")
+
+    def on_livekit_state_update(self, state: LiveKitState):
+        self.after(0, lambda s=state: self._render_livekit_state(s))
+
+    def _render_livekit_state(self, state: LiveKitState):
+        if state.running:
+            self.lbl_status.config(
+                text=f"Статус: {'online' if state.connected else 'подключение...'}",
+                foreground=("#0a0" if state.connected else "#b60"),
+            )
+            self.btn_start.config(state="disabled")
+            self.btn_stop.config(state="normal")
+        else:
+            self.lbl_status.config(text="Статус: offline", foreground="#b00")
+            self.btn_start.config(state="normal")
+            self.btn_stop.config(state="disabled")
+        self.lbl_extra.config(
+            text=f"LiveKit room: {state.room_name or '-'} | Connected: {'yes' if state.connected else 'no'}"
+        )
+        if state.last_error:
+            self.title(f"Audio Streamer (LiveKit) — ошибка: {state.last_error}")
+        else:
+            self.title("Audio Streamer (LiveKit)")
 
     def on_state_update(self, state: StreamState):
         self.after(0, lambda s=state: self._render_state(s))
@@ -628,7 +725,8 @@ class App(tk.Tk):
 
     def on_close(self):
         try:
-            self.client.stop()
+            self.livekit_client.stop()
+            self.legacy_client.stop()
         except Exception:
             pass
         self.after(300, self.destroy)

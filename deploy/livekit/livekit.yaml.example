@@ -1,0 +1,24 @@
+port: 7880
+bind_addresses:
+  - ""
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: true
+
+redis:
+  address: redis:6379
+
+keys:
+  devkey: REPLACE_WITH_LONG_SECRET
+
+turn:
+  enabled: true
+  domain: livekit.example.com
+  cert_file: /certs/fullchain.pem
+  key_file: /certs/privkey.pem
+
+logging:
+  level: info
