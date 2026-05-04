@@ -164,7 +164,8 @@ class LiveKitStreamClient:
                 self._sc_pump_task = asyncio.create_task(_pump_soundcard())
                 self.track = rtc.LocalAudioTrack.create_audio_track("screen-audio", source)
                 opts = rtc.TrackPublishOptions()
-                opts.source = rtc.TrackSource.SOURCE_SCREENSHARE_AUDIO
+                # Как микрофон: совместимость с подписчиками/токенами; сам сигнал по-прежнему loopback.
+                opts.source = rtc.TrackSource.SOURCE_MICROPHONE
                 await self.room.local_participant.publish_track(self.track, opts)
             else:
                 # livekit.rtc.MediaDevices builds each frame from indata[start:end, 0] only, but still

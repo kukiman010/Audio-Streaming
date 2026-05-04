@@ -128,16 +128,24 @@ async def index(request: web.Request) -> web.Response:
           throw new Error(tokenJson.error || "ответ без token");
         }}
         const lkRoom = new Room();
-        lkRoom.on("trackSubscribed", (track) => {{
-          if (track.kind === "audio") {{
+        function attachIfAudio(track) {{
+          if (track && track.kind === "audio") {{
             track.attach(audio);
             status.textContent = "audio subscribed";
           }}
-        }});
+        }}
+        lkRoom.on("trackSubscribed", (track) => attachIfAudio(track));
         lkRoom.on("disconnected", () => {{ status.textContent = "disconnected"; }});
         await lkRoom.connect(url, tokenJson.token);
         roomRef = lkRoom;
         status.textContent = "connected";
+        // Участники уже в комнате: цепляем уже опубликованные аудио (Maps в SDK)
+        lkRoom.remoteParticipants.forEach((participant) => {{
+          participant.audioTrackPublications.forEach((pub) => {{
+            if (pub.track) attachIfAudio(pub.track);
+            pub.on("subscribed", (track) => attachIfAudio(track));
+          }});
+        }});
       }} catch (e) {{
         let msg = (e && e.message) ? e.message : String(e);
         if (/Failed to fetch|NetworkError|load failed/i.test(msg)) {{
