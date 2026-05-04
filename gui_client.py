@@ -840,8 +840,9 @@ class App(tk.Tk):
                     self.lbl_loopback_hint.config(text=lb_err)
                 elif self.loopback_devices:
                     self.lbl_loopback_hint.config(
-                        text="Важно: только строки с префиксом sc_lb: — запись из Windows (наушники/HDMI). "
-                        "Числа 0, 9, 23 без sc_lb: — это микрофоны, не Spotify."
+                        text="Первый пункт в списке — выход «по умолчанию» в Windows (куда сейчас играет звук). "
+                        "Если музыка в наушниках, а выбран loopback монитора (HDMI/NVIDIA) — в эфире будет тишина. "
+                        "Пункты без префикса sc_lb: — это микрофоны (режим «Микрофон»)."
                     )
                 else:
                     self.lbl_loopback_hint.config(

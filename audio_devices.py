@@ -97,6 +97,20 @@ def list_windows_loopback_devices() -> Tuple[List[AudioInputDevice], Optional[st
         if _com_warn:
             hint = f"{_com_warn}. {hint}"
         return [], hint
+
+    # Первым — loopback того же выхода, что «По умолчанию» в Windows (наушники vs HDMI и т.д.)
+    try:
+        ds_name = sc.default_speaker().name.lower()
+    except Exception:
+        ds_name = ""
+
+    def _sort_key(d: AudioInputDevice) -> Tuple[int, str]:
+        n = d.name.lower()
+        if ds_name and (ds_name in n or n in ds_name):
+            return (0, n)
+        return (1, n)
+
+    out.sort(key=_sort_key)
     return out, None
 
 

@@ -98,8 +98,10 @@ class LiveKitStreamClient:
 
                 source = rtc.AudioSource(int(sample_rate), 1, loop=loop)
                 self._sc_source = source
-                q: asyncio.Queue = asyncio.Queue(maxsize=50)
+                q: asyncio.Queue = asyncio.Queue(maxsize=200)
                 frame_samples = max(1, int(sample_rate) // 100)
+                # Как в livekit MediaDevices: буфер ~100 ms, нарезка на кадры 10 ms — стабильнее WASAPI loopback
+                block_frames = frame_samples * 10
 
                 def _loopback_worker() -> None:
                     import soundcard as sc  # type: ignore[import-untyped]
@@ -112,28 +114,33 @@ class LiveKitStreamClient:
                         ch = min(int(sc_mic.channels), 2)
                         with sc_mic.recorder(int(sample_rate), channels=ch) as rec:
                             while self._stop_event and not self._stop_event.is_set():
-                                data = rec.record(frame_samples)
-                                if data.ndim == 2 and data.shape[1] >= 2:
-                                    mono = np.mean(data[:, :2], axis=1, dtype=np.float64)
-                                elif data.ndim == 2:
-                                    mono = data[:, 0].astype(np.float64)
-                                else:
-                                    mono = data.astype(np.float64)
-                                pcm = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
-                                frame = rtc.AudioFrame(
-                                    pcm.tobytes(),
-                                    int(sample_rate),
-                                    1,
-                                    frame_samples,
-                                )
+                                data = rec.record(block_frames)
+                                n_slice = block_frames // frame_samples
+                                for i in range(n_slice):
+                                    seg = data[i * frame_samples : (i + 1) * frame_samples]
+                                    if seg.shape[0] < frame_samples:
+                                        break
+                                    if seg.ndim == 2 and seg.shape[1] >= 2:
+                                        mono = np.mean(seg[:, :2], axis=1, dtype=np.float64)
+                                    elif seg.ndim == 2:
+                                        mono = seg[:, 0].astype(np.float64)
+                                    else:
+                                        mono = seg.astype(np.float64)
+                                    pcm = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
+                                    frame = rtc.AudioFrame(
+                                        pcm.tobytes(),
+                                        int(sample_rate),
+                                        1,
+                                        frame_samples,
+                                    )
 
-                                def _enqueue(fr: rtc.AudioFrame) -> None:
-                                    try:
-                                        q.put_nowait(fr)
-                                    except asyncio.QueueFull:
-                                        pass
+                                    def _enqueue(fr: rtc.AudioFrame) -> None:
+                                        try:
+                                            q.put_nowait(fr)
+                                        except asyncio.QueueFull:
+                                            pass
 
-                                loop.call_soon_threadsafe(_enqueue, frame)
+                                    loop.call_soon_threadsafe(_enqueue, frame)
                     except Exception as e:
 
                         def _fail() -> None:
