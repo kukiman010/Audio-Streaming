@@ -14,11 +14,36 @@ class AudioInputDevice:
     default_sample_rate: int
 
 
+def _list_windows_loopback_soundcard() -> List[AudioInputDevice]:
+    """WASAPI loopback (звук с экрана / колонок / выбранного выхода). Только Windows + soundcard."""
+    try:
+        import soundcard as sc  # type: ignore[import-untyped]
+    except Exception:
+        return []
+    out: List[AudioInputDevice] = []
+    for idx, m in enumerate(sc.all_microphones(include_loopback=True)):
+        if not getattr(m, "isloopback", False):
+            continue
+        out.append(
+            AudioInputDevice(
+                device_id=f"sc_lb:{idx}",
+                name=f"Звук с экрана: {m.name}",
+                backend="WASAPI loopback",
+                max_input_channels=int(getattr(m, "channels", 2) or 2),
+                default_sample_rate=48000,
+            )
+        )
+    return out
+
+
 def list_input_devices() -> List[AudioInputDevice]:
     devices = sd.query_devices()
     host_apis = sd.query_hostapis()
     result: List[AudioInputDevice] = []
     os_name = platform.system().lower()
+
+    if "windows" in os_name:
+        result.extend(_list_windows_loopback_soundcard())
 
     for idx, dev in enumerate(devices):
         max_input = int(dev.get("max_input_channels", 0))
