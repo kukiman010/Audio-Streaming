@@ -82,7 +82,8 @@ async def index(request: web.Request) -> web.Response:
     input, button {{ padding: 8px; margin: 4px 0; width: 100%; box-sizing: border-box; }}
     .status {{ margin-top: 8px; color: #444; white-space: pre-wrap; }}
     .hint {{ font-size: 0.9rem; color: #555; margin: 0.5rem 0 1rem; line-height: 1.4; }}
-    .stream-audio {{ width: 100%; margin-top: 0.5rem; min-height: 48px; }}
+    /* video: на Chrome Android стабильнее, чем audio, для WebRTC + медиа-уведомления */
+    .stream-audio {{ width: 100%; margin-top: 0.5rem; min-height: 56px; background: #111; }}
     #tapToPlay {{ display: none; margin-top: 12px; padding: 12px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; }}
     #tapToPlay.show {{ display: block; }}
     #tapToPlayBtn {{ font-size: 1.05rem; font-weight: 600; }}
@@ -95,7 +96,7 @@ async def index(request: web.Request) -> web.Response:
       <strong>LiveKit WS URL</strong> — адрес сигнального WebSocket (порт обычно 7880). Значение по умолчанию подставляется из LIVEKIT_URL или из имени хоста этой страницы.
       С другого ПК/телефона нельзя оставлять <code>127.0.0.1</code> — укажите IP или имя машины, где запущен LiveKit.
       Страница открыта по HTTPS — нужен <code>wss://</code> и TLS на стороне LiveKit (иначе браузер блокирует «небезопасный» ws).
-      Звук — WebRTC (<code>MediaStream</code> в LiveKit), не прогрессивный MP3 по URL: внешне у <code>&lt;audio controls&gt;</code> привычный плеер внизу элемента; на телефоне для шторки уведомлений обновляется <strong>Media Session</strong>. На iOS Safari звук при заблокированном экране иногда ограничен самой системой — держите вкладку активной или используйте «Включить звук», если эфир начался после входа. Нужен актуальный <code>server.py</code> на машине. Соединение с комнатой не рвётся при уходе со страницы (в SDK отключено авто‑отключение).
+      Звук — WebRTC (<code>MediaStream</code>): на телефоне воспроизведение идёт через <code>&lt;video playsinline&gt;</code> (на Chrome для Android это надёжнее, чем чистый audio). Шторка уведомлений — через <strong>Media Session</strong> и длительность «живого» потока в позиции (иначе ОС может не показать полноценный медиа‑контроль). При блокировке экрана возможности ограничены самим браузером; если звук обрывается — попробуйте «Включить звук» после старта эфира. Нужен актуальный <code>server.py</code>. Соединение с комнатой не рвётся при уходе со страницы (в SDK отключено авто‑отключение).
     </p>
     <label>LiveKit WS URL</label>
     <input id="url" value="{default_lk}" />
@@ -109,7 +110,9 @@ async def index(request: web.Request) -> web.Response:
       <button type="button" id="tapToPlayBtn">Включить звук</button>
       <p class="hint" style="margin: 8px 0 0;">Если эфир начался после входа в комнату, браузер на телефоне мог заблокировать автозвук — нажмите кнопку выше.</p>
     </div>
-    <audio id="player" class="stream-audio" controls playsinline webkit-playsinline preload="metadata"></audio>
+    <!-- Отдельный скрытый элемент только для «прогрева» жеста — не смешивать с WebRTC (иначе Chrome Android ломает attach/UI). -->
+    <audio id="primeSilent" preload="auto" playsinline style="display:none;width:0;height:0;position:absolute;visibility:hidden" aria-hidden="true"></audio>
+    <video id="player" class="stream-audio" controls playsinline webkit-playsinline preload="metadata"></video>
   </div>
   <script type="module">
     import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
@@ -118,6 +121,7 @@ async def index(request: web.Request) -> web.Response:
     const player = document.getElementById("player");
     const tapToPlayEl = document.getElementById("tapToPlay");
     const tapToPlayBtn = document.getElementById("tapToPlayBtn");
+    const primeSilent = document.getElementById("primeSilent");
     let roomRef = null;
     let mediaSessionKeepAlive = null;
     /** Минимальный WAV — синхронное воспроизведение в том же тике, что и tap (iOS / автозапуск). */
@@ -127,7 +131,34 @@ async def index(request: web.Request) -> web.Response:
     try {{
       player.setAttribute("playsinline", "");
       player.playsInline = true;
+      if ("disablePictureInPicture" in player) player.disablePictureInPicture = true;
     }} catch (_) {{}}
+
+    function stopPrimeSilent() {{
+      if (!primeSilent) return;
+      try {{
+        primeSilent.pause();
+        primeSilent.loop = false;
+        primeSilent.removeAttribute("src");
+        primeSilent.srcObject = null;
+        primeSilent.src = "";
+      }} catch (_) {{}}
+    }}
+
+    function syncMediaSessionPositionState() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        if (player.paused || !player.srcObject) {{
+          navigator.mediaSession.setPositionState(null);
+          return;
+        }}
+        navigator.mediaSession.setPositionState({{
+          duration: Number.MAX_SAFE_INTEGER,
+          playbackRate: 1,
+          position: 0,
+        }});
+      }} catch (_) {{}}
+    }}
 
     function showTapToPlay() {{
       tapToPlayEl.classList.add("show");
@@ -137,18 +168,20 @@ async def index(request: web.Request) -> web.Response:
     }}
 
     /**
-     * Должно вызываться синхронно из обработчика клика (до первого await),
-     * иначе Safari/Android снимают «user activation» и блокируют звук при поздней подписке на трек.
+     * Должно вызываться синхронно из обработчика клика (до первого await).
+     * Отдельный скрытый &lt;audio&gt; — не трогать основной video-плеер с WebRTC (Chrome Android).
      */
     function primeAudioElementInGesture() {{
       try {{
-        player.removeAttribute("src");
-        player.srcObject = null;
-        player.src = SILENT_WAV_DATA_URI;
-        player.loop = true;
-        player.muted = true;
-        player.volume = 0;
-        const pr = player.play();
+        if (!primeSilent) return;
+        primeSilent.pause();
+        primeSilent.removeAttribute("src");
+        primeSilent.srcObject = null;
+        primeSilent.src = SILENT_WAV_DATA_URI;
+        primeSilent.loop = true;
+        primeSilent.muted = true;
+        primeSilent.volume = 0;
+        const pr = primeSilent.play();
         if (pr && typeof pr.then === "function") pr.catch(() => {{}});
       }} catch (_) {{}}
       try {{
@@ -201,7 +234,8 @@ async def index(request: web.Request) -> web.Response:
         if (roomRef) await roomRef.startAudio();
       }} catch (_) {{}}
       try {{
-        preparePlayerForLiveTrack();
+        player.muted = false;
+        if (player.volume === 0) player.volume = 1;
         await player.play();
         hideTapToPlay();
         ensureMediaSessionMetadata();
@@ -241,6 +275,7 @@ async def index(request: web.Request) -> web.Response:
       if (!("mediaSession" in navigator)) return;
       try {{
         navigator.mediaSession.playbackState = player.paused ? "paused" : "playing";
+        syncMediaSessionPositionState();
       }} catch (_) {{}}
     }}
 
@@ -300,6 +335,7 @@ async def index(request: web.Request) -> web.Response:
 
     joinBtn.addEventListener("click", async () => {{
       /** Сразу при нажатии (до await), иначе мобильный Safari не считает жестом unlock для позднего трека. */
+      stopPrimeSilent();
       primeAudioElementInGesture();
       hideTapToPlay();
       try {{
@@ -339,6 +375,10 @@ async def index(request: web.Request) -> web.Response:
         lkRoom.on("trackSubscribed", (track) => attachIfAudio(track));
         lkRoom.on("disconnected", () => {{
           stopMediaSessionKeepAlive();
+          stopPrimeSilent();
+          try {{
+            if ("mediaSession" in navigator) navigator.mediaSession.setPositionState(null);
+          }} catch (_) {{}}
           status.textContent = "disconnected";
           hideTapToPlay();
         }});
@@ -361,11 +401,27 @@ async def index(request: web.Request) -> web.Response:
         startMediaSessionKeepAlive();
         ensureMediaSessionMetadata();
         syncMediaSessionPlaying();
+        const scheduleMobilePlaybackRetry = () => {{
+          [400, 1200, 2500].forEach((ms) => {{
+            setTimeout(() => {{
+              try {{
+                if (!roomRef || roomRef !== lkRoom || !player.srcObject) return;
+                if (player.paused) void unlockPlaybackAfterAttach(lkRoom);
+                if (player.paused) showTapToPlay();
+              }} catch (_) {{}}
+            }}, ms);
+          }});
+        }};
+        scheduleMobilePlaybackRetry();
       }} catch (e) {{
         try {{
           if (roomRef) await roomRef.disconnect();
         }} catch (_) {{}}
         roomRef = null;
+        stopPrimeSilent();
+        try {{
+          if ("mediaSession" in navigator) navigator.mediaSession.setPositionState(null);
+        }} catch (_) {{}}
         let msg = (e && e.message) ? e.message : String(e);
         if (/Failed to fetch|NetworkError|load failed/i.test(msg)) {{
           msg += "\\n\\nЧастые причины: неверный хост (127.0.0.1 с другого устройства), LiveKit не запущен, порт 7880 закрыт файрволом, или страница по HTTPS а URL начинается с ws:// (нужен wss://).";
