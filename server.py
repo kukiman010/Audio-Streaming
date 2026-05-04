@@ -82,6 +82,7 @@ async def index(request: web.Request) -> web.Response:
     input, button {{ padding: 8px; margin: 4px 0; width: 100%; box-sizing: border-box; }}
     .status {{ margin-top: 8px; color: #444; white-space: pre-wrap; }}
     .hint {{ font-size: 0.9rem; color: #555; margin: 0.5rem 0 1rem; line-height: 1.4; }}
+    .webrtc-player {{ width: 100%; max-height: 140px; background: #111; border-radius: 8px; }}
   </style>
 </head>
 <body>
@@ -91,7 +92,7 @@ async def index(request: web.Request) -> web.Response:
       <strong>LiveKit WS URL</strong> — адрес сигнального WebSocket (порт обычно 7880). Значение по умолчанию подставляется из LIVEKIT_URL или из имени хоста этой страницы.
       С другого ПК/телефона нельзя оставлять <code>127.0.0.1</code> — укажите IP или имя машины, где запущен LiveKit.
       Страница открыта по HTTPS — нужен <code>wss://</code> и TLS на стороне LiveKit (иначе браузер блокирует «небезопасный» ws).
-      На телефоне после Join звук идёт через плеер страницы и Media Session; соединение не рвётся при блокировке экрана (отключено авто‑отключение по уходу со страницы в SDK).
+      Раньше часто делали поток по HTTP (например MP3) и подключали его как <code>&lt;audio src="…"&gt;</code> — Chromium считает это обычным «URL‑плеером». Здесь звук приходит по WebRTC (<code>MediaStream</code>) из LiveKit — это другой внутренний путь. Для вывода используется <code>&lt;video playsinline&gt;</code>: только аудио без картинки (чёрная область), но на Android Chrome обычно срабатывают те же механизмы, что и у нормального медиа в плеере (уведомление, фон). Соединение не рвётся при уходе со страницы в SDK.
     </p>
     <label>LiveKit WS URL</label>
     <input id="url" value="{default_lk}" />
@@ -101,13 +102,13 @@ async def index(request: web.Request) -> web.Response:
     <input id="identity" value="web-viewer" />
     <button id="join">Join room</button>
     <div class="status" id="status">offline</div>
-    <audio id="audio" autoplay playsinline controls></audio>
+    <video id="player" class="webrtc-player" playsinline webkit-playsinline autoplay controls></video>
   </div>
   <script type="module">
     import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
     const joinBtn = document.getElementById("join");
     const status = document.getElementById("status");
-    const audio = document.getElementById("audio");
+    const player = document.getElementById("player");
     let roomRef = null;
     let mediaSessionKeepAlive = null;
 
@@ -115,15 +116,15 @@ async def index(request: web.Request) -> web.Response:
       if (!("mediaSession" in navigator)) return;
       try {{
         navigator.mediaSession.setActionHandler("play", () => {{
-          audio.play().catch(() => {{}});
+          player.play().catch(() => {{}});
           syncMediaSessionPlaying();
         }});
         navigator.mediaSession.setActionHandler("pause", () => {{
-          audio.pause();
+          player.pause();
           syncMediaSessionPlaying();
         }});
         navigator.mediaSession.setActionHandler("stop", () => {{
-          audio.pause();
+          player.pause();
           syncMediaSessionPlaying();
         }});
       }} catch (_) {{}}
@@ -132,7 +133,7 @@ async def index(request: web.Request) -> web.Response:
     function syncMediaSessionPlaying() {{
       if (!("mediaSession" in navigator)) return;
       try {{
-        navigator.mediaSession.playbackState = audio.paused ? "paused" : "playing";
+        navigator.mediaSession.playbackState = player.paused ? "paused" : "playing";
       }} catch (_) {{}}
     }}
 
@@ -150,7 +151,7 @@ async def index(request: web.Request) -> web.Response:
     function startMediaSessionKeepAlive() {{
       if (mediaSessionKeepAlive) clearInterval(mediaSessionKeepAlive);
       mediaSessionKeepAlive = setInterval(() => {{
-        if (!roomRef || audio.paused) return;
+        if (!roomRef || player.paused) return;
         ensureMediaSessionMetadata();
         syncMediaSessionPlaying();
       }}, 15000);
@@ -165,20 +166,20 @@ async def index(request: web.Request) -> web.Response:
 
     wireMediaSessionControls();
 
-    audio.addEventListener("playing", () => {{
+    player.addEventListener("playing", () => {{
       ensureMediaSessionMetadata();
       syncMediaSessionPlaying();
     }});
-    audio.addEventListener("play", () => {{
+    player.addEventListener("play", () => {{
       syncMediaSessionPlaying();
       ensureMediaSessionMetadata();
     }});
-    audio.addEventListener("pause", syncMediaSessionPlaying);
+    player.addEventListener("pause", syncMediaSessionPlaying);
 
     document.addEventListener("visibilitychange", () => {{
       if (!roomRef) return;
       if (document.hidden) {{
-        if (!audio.paused) {{
+        if (!player.paused) {{
           ensureMediaSessionMetadata();
           syncMediaSessionPlaying();
         }}
@@ -187,7 +188,7 @@ async def index(request: web.Request) -> web.Response:
       ensureMediaSessionMetadata();
       syncMediaSessionPlaying();
       roomRef.startAudio().catch(() => {{}});
-      audio.play().catch(() => {{}});
+      player.play().catch(() => {{}});
     }});
 
     joinBtn.addEventListener("click", async () => {{
@@ -216,7 +217,7 @@ async def index(request: web.Request) -> web.Response:
         }});
         function attachIfAudio(track) {{
           if (track && track.kind === "audio") {{
-            track.attach(audio);
+            track.attach(player);
             status.textContent = "audio subscribed";
             ensureMediaSessionMetadata();
             syncMediaSessionPlaying();
