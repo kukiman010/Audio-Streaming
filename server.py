@@ -109,6 +109,25 @@ async def index(request: web.Request) -> web.Response:
     const status = document.getElementById("status");
     const audio = document.getElementById("audio");
     let roomRef = null;
+    let mediaSessionKeepAlive = null;
+
+    function wireMediaSessionControls() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        navigator.mediaSession.setActionHandler("play", () => {{
+          audio.play().catch(() => {{}});
+          syncMediaSessionPlaying();
+        }});
+        navigator.mediaSession.setActionHandler("pause", () => {{
+          audio.pause();
+          syncMediaSessionPlaying();
+        }});
+        navigator.mediaSession.setActionHandler("stop", () => {{
+          audio.pause();
+          syncMediaSessionPlaying();
+        }});
+      }} catch (_) {{}}
+    }}
 
     function syncMediaSessionPlaying() {{
       if (!("mediaSession" in navigator)) return;
@@ -128,6 +147,28 @@ async def index(request: web.Request) -> web.Response:
       }} catch (_) {{}}
     }}
 
+    function startMediaSessionKeepAlive() {{
+      if (mediaSessionKeepAlive) clearInterval(mediaSessionKeepAlive);
+      mediaSessionKeepAlive = setInterval(() => {{
+        if (!roomRef || audio.paused) return;
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
+      }}, 15000);
+    }}
+
+    function stopMediaSessionKeepAlive() {{
+      if (mediaSessionKeepAlive) {{
+        clearInterval(mediaSessionKeepAlive);
+        mediaSessionKeepAlive = null;
+      }}
+    }}
+
+    wireMediaSessionControls();
+
+    audio.addEventListener("playing", () => {{
+      ensureMediaSessionMetadata();
+      syncMediaSessionPlaying();
+    }});
     audio.addEventListener("play", () => {{
       syncMediaSessionPlaying();
       ensureMediaSessionMetadata();
@@ -135,7 +176,14 @@ async def index(request: web.Request) -> web.Response:
     audio.addEventListener("pause", syncMediaSessionPlaying);
 
     document.addEventListener("visibilitychange", () => {{
-      if (document.hidden || !roomRef) return;
+      if (!roomRef) return;
+      if (document.hidden) {{
+        if (!audio.paused) {{
+          ensureMediaSessionMetadata();
+          syncMediaSessionPlaying();
+        }}
+        return;
+      }}
       ensureMediaSessionMetadata();
       syncMediaSessionPlaying();
       roomRef.startAudio().catch(() => {{}});
@@ -171,14 +219,22 @@ async def index(request: web.Request) -> web.Response:
             track.attach(audio);
             status.textContent = "audio subscribed";
             ensureMediaSessionMetadata();
-            audio.play().catch(() => {{}});
+            syncMediaSessionPlaying();
+            lkRoom.startAudio().catch(() => {{}});
           }}
         }}
         lkRoom.on("trackSubscribed", (track) => attachIfAudio(track));
-        lkRoom.on("disconnected", () => {{ status.textContent = "disconnected"; }});
+        lkRoom.on("disconnected", () => {{
+          stopMediaSessionKeepAlive();
+          status.textContent = "disconnected";
+        }});
         await lkRoom.connect(url, tokenJson.token);
         roomRef = lkRoom;
         status.textContent = "connected";
+        // Разблокировка звука в рамках жеста (клик Join): важно для iOS / политик автозапуска
+        try {{
+          await lkRoom.startAudio();
+        }} catch (_) {{}}
         // Участники уже в комнате: цепляем уже опубликованные аудио (Maps в SDK)
         lkRoom.remoteParticipants.forEach((participant) => {{
           participant.audioTrackPublications.forEach((pub) => {{
@@ -186,6 +242,12 @@ async def index(request: web.Request) -> web.Response:
             pub.on("subscribed", (track) => attachIfAudio(track));
           }});
         }});
+        try {{
+          await lkRoom.startAudio();
+        }} catch (_) {{}}
+        startMediaSessionKeepAlive();
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
       }} catch (e) {{
         let msg = (e && e.message) ? e.message : String(e);
         if (/Failed to fetch|NetworkError|load failed/i.test(msg)) {{
