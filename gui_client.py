@@ -649,6 +649,7 @@ class App(tk.Tk):
 
         self._audio_drawer_open = False
         self._helper_url_for_viewer: str = ""
+        self._qr_photo_ref: Optional[tk.PhotoImage] = None
 
         self.legacy_client = StreamClient(self.on_state_update)
         self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update)
@@ -793,21 +794,35 @@ class App(tk.Tk):
         self.btn_start.grid(row=12, column=2, **pad, sticky="we")
         self.btn_stop.grid(row=12, column=3, **pad, sticky="we")
 
-        self.frm_log = ttk.LabelFrame(frm, text="Веб-просмотр и сообщения")
-        self.frm_log.grid(row=13, column=0, columnspan=4, sticky="nsew", padx=8, pady=6)
+        self.frm_web = ttk.LabelFrame(frm, text="Веб-просмотр")
+        self.frm_web.grid(row=13, column=0, columnspan=4, sticky="nsew", padx=8, pady=6)
+        self.frm_web_inner = ttk.Frame(self.frm_web)
+        self.frm_web_inner.pack(fill="both", expand=True, padx=6, pady=6)
+        self.lbl_qr = tk.Label(
+            self.frm_web_inner,
+            text="После успешного старта трансляции (LiveKit)\nздесь появится QR со ссылкой на страницу слушателя.",
+            fg="#666",
+            justify="center",
+            width=36,
+            height=5,
+        )
+        self.lbl_qr.pack(side="left", anchor="nw")
+        self.frm_web_right = ttk.Frame(self.frm_web_inner)
+        self.frm_web_right.pack(side="left", fill="both", expand=True, padx=(12, 0))
         ttk.Label(
-            self.frm_log,
-            text="Ссылка на веб-трансляцию (страница слушателя на helper, откройте в браузере):",
-        ).pack(anchor="w", padx=6, pady=(4, 2))
-        self.entry_web = ttk.Entry(self.frm_log, textvariable=self.var_web_viewer, width=72)
-        self.entry_web.pack(fill="x", padx=6, pady=(0, 6))
+            self.frm_web_right,
+            text="Та же ссылка текстом (страница слушателя на helper):",
+        ).pack(anchor="w")
+        self.entry_web = ttk.Entry(self.frm_web_right, textvariable=self.var_web_viewer, width=72)
+        self.entry_web.pack(fill="x", pady=(4, 0))
         try:
             self.entry_web.state(["readonly"])
         except tk.TclError:
             self.entry_web.configure(state="readonly")
-        ttk.Label(self.frm_log, text="Ошибки и диагностика (не в заголовке окна):").pack(anchor="w", padx=6)
-        self.txt_errors = scrolledtext.ScrolledText(self.frm_log, height=5, wrap="word", font=("Segoe UI", 9))
-        self.txt_errors.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+
+        self.frm_errors = ttk.LabelFrame(frm, text="Ошибки и диагностика")
+        self.txt_errors = scrolledtext.ScrolledText(self.frm_errors, height=4, wrap="word", font=("Segoe UI", 9))
+        self.txt_errors.pack(fill="both", expand=True, padx=6, pady=6)
         self.txt_errors.configure(state="disabled")
 
         frm.columnconfigure(1, weight=1)
@@ -824,16 +839,82 @@ class App(tk.Tk):
         # Close handler
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _set_entry_web_readonly(self, value: str) -> None:
+    def _make_qr_photo(self, url: str, size_px: int = 200) -> Optional[tk.PhotoImage]:
+        try:
+            from PIL import Image, ImageTk
+            import qrcode
+        except ImportError:
+            return None
+        try:
+            qr = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=4,
+                border=2,
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+            pil_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            pil_img = pil_img.resize((size_px, size_px), Image.Resampling.NEAREST)
+            return ImageTk.PhotoImage(pil_img)
+        except Exception:
+            return None
+
+    def _refresh_qr_image(self, qr_url: Optional[str]) -> None:
+        url = (qr_url or "").strip()
+        if url and not url.endswith("/"):
+            url = url + "/"
+        if url.startswith(("http://", "https://")):
+            photo = self._make_qr_photo(url)
+            if photo is not None:
+                self._qr_photo_ref = photo
+                self.lbl_qr.configure(image=photo, text="", width=0, height=0)
+                return
+            self._qr_photo_ref = None
+            self.lbl_qr.configure(
+                image="",
+                text="Не удалось построить QR.\nУстановите: pip install qrcode pillow",
+                fg="#a00",
+                width=40,
+                height=8,
+            )
+            return
+        self._qr_photo_ref = None
+        if self.var_transport.get() != "LiveKit (native)":
+            self.lbl_qr.configure(
+                image="",
+                text="QR со ссылкой на страницу слушателя\nдоступен только для транспорта LiveKit.",
+                fg="#666",
+                justify="center",
+                width=36,
+                height=5,
+            )
+            return
+        self.lbl_qr.configure(
+            image="",
+            text="После успешного старта трансляции (LiveKit)\nздесь появится QR со ссылкой на страницу слушателя.",
+            fg="#666",
+            justify="center",
+            width=36,
+            height=5,
+        )
+
+    def _set_web_viewer(self, display: str, qr_url: Optional[str] = None) -> None:
         try:
             self.entry_web.state(["!readonly"])
         except tk.TclError:
             self.entry_web.configure(state="normal")
-        self.var_web_viewer.set(value)
+        self.var_web_viewer.set(display)
         try:
             self.entry_web.state(["readonly"])
         except tk.TclError:
             self.entry_web.configure(state="readonly")
+        resolved = (qr_url or "").strip()
+        if not resolved and display:
+            m = re.search(r"https?://[^\s]+", display)
+            if m:
+                resolved = m.group(0).strip()
+        self._refresh_qr_image(resolved if resolved.startswith(("http://", "https://")) else None)
 
     def _ensure_audio_drawer_open(self) -> None:
         if self._audio_drawer_open:
@@ -850,6 +931,11 @@ class App(tk.Tk):
         if text:
             self.txt_errors.insert("1.0", text)
         self.txt_errors.configure(state="disabled")
+        err = (text or "").strip()
+        if err:
+            self.frm_errors.grid(row=14, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 6))
+        else:
+            self.frm_errors.grid_remove()
 
     def _toggle_audio_drawer(self) -> None:
         self._audio_drawer_open = not self._audio_drawer_open
@@ -917,8 +1003,7 @@ class App(tk.Tk):
         self.on_refresh_devices()
         self._update_audio_panel_visibility()
         self._update_audio_drawer_summary()
-        if not is_livekit:
-            self._set_entry_web_readonly("")
+        self._set_web_viewer("", None)
 
     def _update_audio_panel_visibility(self) -> None:
         lk = self.var_transport.get() == "LiveKit (native)"
@@ -1067,11 +1152,16 @@ class App(tk.Tk):
                 )
                 self.btn_start.config(state="disabled")
                 self.btn_stop.config(state="normal")
-                base = self._helper_url_for_viewer
-                self._set_entry_web_readonly(f"{base}/  — в браузере укажите ту же комнату: «{room}»")
+                base = self._helper_url_for_viewer.rstrip("/")
+                viewer_url = f"{base}/"
+                self._set_web_viewer(
+                    f"{viewer_url}  — в браузере укажите ту же комнату: «{room}»",
+                    qr_url=viewer_url,
+                )
                 self._set_error_log("")
             except Exception as e:
                 self._helper_url_for_viewer = ""
+                self._set_web_viewer("", None)
                 self._set_error_log(str(e))
         else:
             if not FFMPEG_BIN:
@@ -1090,9 +1180,10 @@ class App(tk.Tk):
                 )
                 self.btn_start.config(state="disabled")
                 self.btn_stop.config(state="normal")
-                self._set_entry_web_readonly("— (legacy WebSocket: отдельной веб-страницы helper нет)")
+                self._set_web_viewer("— (legacy WebSocket: отдельной веб-страницы helper нет)", None)
                 self._set_error_log("")
             except Exception as e:
+                self._set_web_viewer("", None)
                 self._set_error_log(str(e))
 
     def on_stop(self):
