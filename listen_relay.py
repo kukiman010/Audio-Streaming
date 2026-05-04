@@ -1,8 +1,7 @@
 """
 HTTP MP3-релей комнаты LiveKit → нативный <audio src> в браузере.
 
-Требуется ffmpeg в PATH. Задержка выше, чем у прямого WebRTC в браузере (кодирование MP3 + HTTP),
-но ниже, чем при огромной очереди PCM — см. PCM_QUEUE_MAXSIZE и libmp3lame low-delay опции.
+Требуется ffmpeg в PATH. Один HTTP-клиент = одно подключение к LiveKit + один процесс ffmpeg.
 """
 
 from __future__ import annotations
@@ -24,29 +23,6 @@ logger = logging.getLogger(__name__)
 FFMPEG = shutil.which("ffmpeg") or ""
 
 WAIT_TRACK_TIMEOUT_SEC = 120.0
-
-# Очередь PCM: большое значение накапливало секунды аудио → огромная задержка.
-# Малый буфер + отбрасывание старых кадров при переполнении (как в живом эфире).
-PCM_QUEUE_MAXSIZE = 32
-
-
-def _pcm_try_put_live(q: queue.Queue, data: bytes) -> None:
-    """Один кадр PCM; при полной очереди выбрасываем самый старый — держим задержку малой."""
-    if not data:
-        return
-    try:
-        q.put_nowait(data)
-        return
-    except queue.Full:
-        pass
-    try:
-        q.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        q.put_nowait(data)
-    except queue.Full:
-        pass
 
 
 async def _wait_first_audio_track(room: rtc.Room, timeout: float) -> rtc.Track:
@@ -130,13 +106,8 @@ async def _pipe_track_to_mp3(
 ) -> None:
     proc: subprocess.Popen | None = None
     writer_thread: threading.Thread | None = None
-    stream = rtc.AudioStream.from_track(
-        track=audio_track,
-        sample_rate=48000,
-        num_channels=1,
-        capacity=PCM_QUEUE_MAXSIZE,
-    )
-    pcm_q: queue.Queue = queue.Queue(maxsize=PCM_QUEUE_MAXSIZE)
+    stream = rtc.AudioStream.from_track(track=audio_track, sample_rate=48000, num_channels=1)
+    pcm_q: queue.Queue = queue.Queue(maxsize=512)
 
     try:
         proc = subprocess.Popen(
@@ -145,10 +116,6 @@ async def _pipe_track_to_mp3(
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
                 "-f",
                 "s16le",
                 "-ar",
@@ -161,10 +128,6 @@ async def _pipe_track_to_mp3(
                 "libmp3lame",
                 "-b:a",
                 "96k",
-                "-compression_level",
-                "0",
-                "-write_xing",
-                "0",
                 "-f",
                 "mp3",
                 "pipe:1",
@@ -190,7 +153,7 @@ async def _pipe_track_to_mp3(
                     data = event.frame.data
                     if not data:
                         continue
-                    await asyncio.to_thread(_pcm_try_put_live, pcm_q, data)
+                    await asyncio.to_thread(pcm_q.put, data)
             except Exception as e:
                 logger.debug("feed_livekit: %s", e)
             finally:
@@ -202,7 +165,7 @@ async def _pipe_track_to_mp3(
         async def drain_http() -> None:
             try:
                 while True:
-                    chunk = await asyncio.to_thread(proc.stdout.read, 4096)
+                    chunk = await asyncio.to_thread(proc.stdout.read, 65536)
                     if not chunk:
                         break
                     try:
