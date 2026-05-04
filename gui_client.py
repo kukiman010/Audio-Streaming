@@ -18,7 +18,7 @@ from typing import List, Tuple, Optional, Callable
 import platform
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, scrolledtext
 from audio_devices import (
     AudioInputDevice,
     list_input_devices,
@@ -643,8 +643,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Audio Streamer (LiveKit)")
-        self.geometry("860x580")
-        self.resizable(False, False)
+        self.geometry("940x680")
+        self.minsize(880, 620)
+        self.resizable(True, True)
+
+        self._audio_drawer_open = False
+        self._helper_url_for_viewer: str = ""
 
         self.legacy_client = StreamClient(self.on_state_update)
         self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update)
@@ -689,17 +693,31 @@ class App(tk.Tk):
         self.entry_pairing_secret = ttk.Entry(frm, textvariable=self.var_pairing_secret, width=50, show="*")
         self.entry_pairing_secret.grid(row=4, column=1, sticky="we", **pad, columnspan=3)
 
-        # Источник: на Windows + LiveKit — отдельно «системный звук» (sc_lb) и микрофон (цифры PortAudio)
+        # Источник: выдвижная панель (по умолчанию свёрнута; системный захват — без обязательного выбора в списке)
         self.var_win_route = tk.StringVar(value="system")
-        self.frm_audio = ttk.LabelFrame(frm, text="Источник для трансляции")
-        self.frm_audio.grid(row=5, column=0, columnspan=4, sticky="ew", padx=8, pady=6)
+        self.var_web_viewer = tk.StringVar(value="")
+
+        self.frm_audio_outer = ttk.Frame(frm)
+        self.frm_audio_outer.grid(row=5, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+        self.btn_audio_drawer = ttk.Button(
+            self.frm_audio_outer,
+            text="▶ Источник аудио",
+            width=22,
+            command=self._toggle_audio_drawer,
+        )
+        self.btn_audio_drawer.grid(row=0, column=0, sticky="nw")
+        self.lbl_audio_drawer_summary = ttk.Label(self.frm_audio_outer, text="", foreground="#333")
+        self.lbl_audio_drawer_summary.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.frm_audio_outer.columnconfigure(1, weight=1)
+
+        self.frm_audio = ttk.LabelFrame(self.frm_audio_outer, text="Источник для трансляции")
 
         self.frm_audio_win = ttk.Frame(self.frm_audio)
         self.frm_audio_simple = ttk.Frame(self.frm_audio)
         pad_a = {"padx": 8, "pady": 4}
         ttk.Radiobutton(
             self.frm_audio_win,
-            text="Системный звук (Spotify, браузер, игры) — не микрофон",
+            text="Системный звук (музыки, браузер, игры) — не микрофон",
             variable=self.var_win_route,
             value="system",
             command=self._on_win_audio_mode,
@@ -717,9 +735,11 @@ class App(tk.Tk):
         ).grid(row=2, column=0, sticky="nw", **pad_a)
         self.combo_win_loopback = ttk.Combobox(self.frm_audio_win, state="readonly", width=68)
         self.combo_win_loopback.grid(row=2, column=1, sticky="we", **pad_a)
+        self.combo_win_loopback.bind("<<ComboboxSelected>>", lambda e: self._update_audio_drawer_summary())
         ttk.Label(self.frm_audio_win, text="Микрофон:").grid(row=3, column=0, sticky="nw", **pad_a)
         self.combo_win_mic = ttk.Combobox(self.frm_audio_win, state="readonly", width=68)
         self.combo_win_mic.grid(row=3, column=1, sticky="we", **pad_a)
+        self.combo_win_mic.bind("<<ComboboxSelected>>", lambda e: self._update_audio_drawer_summary())
         self.lbl_loopback_hint = ttk.Label(
             self.frm_audio_win,
             text="",
@@ -733,6 +753,7 @@ class App(tk.Tk):
         ttk.Label(self.frm_audio_simple, text="Устройство:").grid(row=0, column=0, sticky="w", **pad_a)
         self.combo_device = ttk.Combobox(self.frm_audio_simple, state="readonly", width=68)
         self.combo_device.grid(row=0, column=1, sticky="we", **pad_a)
+        self.combo_device.bind("<<ComboboxSelected>>", lambda e: self._update_audio_drawer_summary())
         self.frm_audio_simple.columnconfigure(1, weight=1)
         self.frm_audio.columnconfigure(0, weight=1)
 
@@ -772,9 +793,27 @@ class App(tk.Tk):
         self.btn_start.grid(row=12, column=2, **pad, sticky="we")
         self.btn_stop.grid(row=12, column=3, **pad, sticky="we")
 
+        self.frm_log = ttk.LabelFrame(frm, text="Веб-просмотр и сообщения")
+        self.frm_log.grid(row=13, column=0, columnspan=4, sticky="nsew", padx=8, pady=6)
+        ttk.Label(
+            self.frm_log,
+            text="Ссылка на веб-трансляцию (страница слушателя на helper, откройте в браузере):",
+        ).pack(anchor="w", padx=6, pady=(4, 2))
+        self.entry_web = ttk.Entry(self.frm_log, textvariable=self.var_web_viewer, width=72)
+        self.entry_web.pack(fill="x", padx=6, pady=(0, 6))
+        try:
+            self.entry_web.state(["readonly"])
+        except tk.TclError:
+            self.entry_web.configure(state="readonly")
+        ttk.Label(self.frm_log, text="Ошибки и диагностика (не в заголовке окна):").pack(anchor="w", padx=6)
+        self.txt_errors = scrolledtext.ScrolledText(self.frm_log, height=5, wrap="word", font=("Segoe UI", 9))
+        self.txt_errors.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        self.txt_errors.configure(state="disabled")
+
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(2, weight=1)
         frm.columnconfigure(3, weight=1)
+        frm.rowconfigure(13, weight=1)
 
         # Initial populate
         self.on_transport_changed()
@@ -784,6 +823,83 @@ class App(tk.Tk):
 
         # Close handler
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _set_entry_web_readonly(self, value: str) -> None:
+        try:
+            self.entry_web.state(["!readonly"])
+        except tk.TclError:
+            self.entry_web.configure(state="normal")
+        self.var_web_viewer.set(value)
+        try:
+            self.entry_web.state(["readonly"])
+        except tk.TclError:
+            self.entry_web.configure(state="readonly")
+
+    def _ensure_audio_drawer_open(self) -> None:
+        if self._audio_drawer_open:
+            return
+        self._audio_drawer_open = True
+        self.frm_audio.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.frm_audio_outer.columnconfigure(0, weight=1)
+        self.btn_audio_drawer.configure(text="▼ Источник аудио")
+        self._update_audio_drawer_summary()
+
+    def _set_error_log(self, text: str) -> None:
+        self.txt_errors.configure(state="normal")
+        self.txt_errors.delete("1.0", "end")
+        if text:
+            self.txt_errors.insert("1.0", text)
+        self.txt_errors.configure(state="disabled")
+
+    def _toggle_audio_drawer(self) -> None:
+        self._audio_drawer_open = not self._audio_drawer_open
+        if self._audio_drawer_open:
+            self.frm_audio.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            self.frm_audio_outer.columnconfigure(0, weight=1)
+            self.btn_audio_drawer.configure(text="▼ Источник аудио")
+        else:
+            self.frm_audio.grid_remove()
+            self.btn_audio_drawer.configure(text="▶ Источник аудио")
+        self._update_audio_drawer_summary()
+
+    def _update_audio_drawer_summary(self) -> None:
+        if self.var_transport.get() != "LiveKit (native)":
+            idx = self.combo_device.current()
+            if getattr(self, "pulse_sources", None) and 0 <= idx < len(self.pulse_sources):
+                name = self.pulse_sources[idx][1][:70]
+                self.lbl_audio_drawer_summary.configure(text=f"PulseAudio · {name}")
+            elif getattr(self, "pulse_sources", None):
+                self.lbl_audio_drawer_summary.configure(text="PulseAudio · выберите источник (разверните панель)")
+            else:
+                self.lbl_audio_drawer_summary.configure(text="PulseAudio · нет источников")
+            return
+        if platform.system().lower() != "windows":
+            idx = self.combo_device.current()
+            if self.input_devices and 0 <= idx < len(self.input_devices):
+                d = self.input_devices[idx]
+                self.lbl_audio_drawer_summary.configure(text=f"{d.name[:55]} · {d.backend}")
+            elif self.input_devices:
+                d = self.input_devices[0]
+                self.lbl_audio_drawer_summary.configure(text=f"{d.name[:55]} · {d.backend}")
+            else:
+                self.lbl_audio_drawer_summary.configure(text="Нет устройств ввода")
+            return
+        if self.var_win_route.get() == "system":
+            if self.loopback_devices:
+                li = self.combo_win_loopback.current()
+                i = li if li >= 0 else 0
+                d = self.loopback_devices[i] if i < len(self.loopback_devices) else self.loopback_devices[0]
+                self.lbl_audio_drawer_summary.configure(text=f"Системный звук · {d.name[:50]}")
+            else:
+                self.lbl_audio_drawer_summary.configure(text="Системный звук · loopback не найден (см. подсказку в панели)")
+        else:
+            if self.mic_devices:
+                mi = self.combo_win_mic.current()
+                i = mi if mi >= 0 else 0
+                d = self.mic_devices[i] if i < len(self.mic_devices) else self.mic_devices[0]
+                self.lbl_audio_drawer_summary.configure(text=f"Микрофон · {d.name[:50]}")
+            else:
+                self.lbl_audio_drawer_summary.configure(text="Микрофон не найден")
 
     def _tick(self):
         if self.var_transport.get() == "LiveKit (native)":
@@ -800,6 +916,9 @@ class App(tk.Tk):
         self.btn_delete.config(state="disabled" if is_livekit else "normal")
         self.on_refresh_devices()
         self._update_audio_panel_visibility()
+        self._update_audio_drawer_summary()
+        if not is_livekit:
+            self._set_entry_web_readonly("")
 
     def _update_audio_panel_visibility(self) -> None:
         lk = self.var_transport.get() == "LiveKit (native)"
@@ -812,12 +931,15 @@ class App(tk.Tk):
             self.frm_audio_simple.pack(fill="x", padx=4, pady=4)
 
     def _on_win_audio_mode(self) -> None:
+        if self.var_win_route.get() == "mic":
+            self._ensure_audio_drawer_open()
         if self.var_win_route.get() == "system":
             self.combo_win_loopback.configure(state="readonly")
             self.combo_win_mic.configure(state="disabled")
         else:
             self.combo_win_loopback.configure(state="disabled")
             self.combo_win_mic.configure(state="readonly")
+        self._update_audio_drawer_summary()
 
     def on_refresh_devices(self):
         if self.var_transport.get() == "LiveKit (native)":
@@ -846,7 +968,7 @@ class App(tk.Tk):
                     )
                 else:
                     self.lbl_loopback_hint.config(
-                        text="Loopback не найден. Проверьте: pip install soundcard. Для Spotify выберите выход "
+                        text="Loopback не найден. Проверьте: pip install soundcard. Для музыки выберите выход "
                         "совпадающий с «Параметры звука → вывод»."
                     )
                 self._on_win_audio_mode()
@@ -861,6 +983,7 @@ class App(tk.Tk):
             self.combo_device["values"] = values
             if values:
                 self.combo_device.current(0)
+        self._update_audio_drawer_summary()
 
     def on_create_vdev(self):
         create_virtual_device_interactive(self)
@@ -892,6 +1015,7 @@ class App(tk.Tk):
                 return
             try:
                 server_lk, helper_url = livekit_urls_with_discovery(raw_server)
+                self._helper_url_for_viewer = helper_url.rstrip("/")
                 token = request_publisher_token(
                     helper_url=helper_url,
                     room=room,
@@ -903,7 +1027,7 @@ class App(tk.Tk):
                         if not self.loopback_devices:
                             messagebox.showerror(
                                 "Системный звук недоступен",
-                                "Список «Запись выхода» пуст — захват Spotify/игр через LiveKit невозможен.\n\n"
+                                "Список «Запись выхода» пуст — захват музыки/игр через LiveKit невозможен.\n\n"
                                 "Установите пакет: pip install soundcard\n"
                                 "Перезапустите клиент и нажмите «Обновить источники».\n\n"
                                 "В трансляции должны быть строки вида sc_lb:N — это не то же самое, что пункты 0 или 9 "
@@ -943,8 +1067,12 @@ class App(tk.Tk):
                 )
                 self.btn_start.config(state="disabled")
                 self.btn_stop.config(state="normal")
+                base = self._helper_url_for_viewer
+                self._set_entry_web_readonly(f"{base}/  — в браузере укажите ту же комнату: «{room}»")
+                self._set_error_log("")
             except Exception as e:
-                messagebox.showerror("Ошибка запуска", str(e))
+                self._helper_url_for_viewer = ""
+                self._set_error_log(str(e))
         else:
             if not FFMPEG_BIN:
                 messagebox.showerror("Ошибка", "ffmpeg не найден. Установите пакет ffmpeg.")
@@ -962,8 +1090,10 @@ class App(tk.Tk):
                 )
                 self.btn_start.config(state="disabled")
                 self.btn_stop.config(state="normal")
+                self._set_entry_web_readonly("— (legacy WebSocket: отдельной веб-страницы helper нет)")
+                self._set_error_log("")
             except Exception as e:
-                messagebox.showerror("Ошибка запуска", str(e))
+                self._set_error_log(str(e))
 
     def on_stop(self):
         try:
@@ -995,10 +1125,8 @@ class App(tk.Tk):
         self.lbl_extra.config(
             text=f"LiveKit room: {state.room_name or '-'} | Connected: {'yes' if state.connected else 'no'}"
         )
-        if state.last_error:
-            self.title(f"Audio Streamer (LiveKit) — ошибка: {state.last_error}")
-        else:
-            self.title("Audio Streamer (LiveKit)")
+        self.title("Audio Streamer (LiveKit)")
+        self._set_error_log(state.last_error or "")
 
     def on_state_update(self, state: StreamState):
         self.after(0, lambda s=state: self._render_state(s))
@@ -1020,10 +1148,8 @@ class App(tk.Tk):
         self.lbl_extra.config(
             text=f"Слушателей: {state.listeners} | Отправлено: {kib:.1f} KiB | Аптайм: {int(state.uptime_sec)} c"
         )
-        if state.last_error:
-            self.title(f"Simple Audio Streamer — ошибка: {state.last_error}")
-        else:
-            self.title("Simple Audio Streamer (MP3 over WebSocket)")
+        self.title("Audio Streamer (LiveKit)")
+        self._set_error_log(state.last_error or "")
 
     def on_close(self):
         try:
@@ -1033,7 +1159,6 @@ class App(tk.Tk):
             pass
         self.after(300, self.destroy)
 
-# **
 if __name__ == "__main__":
     app = App()
     app.mainloop()
