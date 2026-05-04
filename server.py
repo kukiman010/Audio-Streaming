@@ -91,6 +91,7 @@ async def index(request: web.Request) -> web.Response:
       <strong>LiveKit WS URL</strong> — адрес сигнального WebSocket (порт обычно 7880). Значение по умолчанию подставляется из LIVEKIT_URL или из имени хоста этой страницы.
       С другого ПК/телефона нельзя оставлять <code>127.0.0.1</code> — укажите IP или имя машины, где запущен LiveKit.
       Страница открыта по HTTPS — нужен <code>wss://</code> и TLS на стороне LiveKit (иначе браузер блокирует «небезопасный» ws).
+      На телефоне после Join звук идёт через плеер страницы и Media Session; соединение не рвётся при блокировке экрана (отключено авто‑отключение по уходу со страницы в SDK).
     </p>
     <label>LiveKit WS URL</label>
     <input id="url" value="{default_lk}" />
@@ -100,14 +101,46 @@ async def index(request: web.Request) -> web.Response:
     <input id="identity" value="web-viewer" />
     <button id="join">Join room</button>
     <div class="status" id="status">offline</div>
-    <audio id="audio" autoplay controls></audio>
+    <audio id="audio" autoplay playsinline controls></audio>
   </div>
   <script type="module">
-    import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.esm.mjs";
+    import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
     const joinBtn = document.getElementById("join");
     const status = document.getElementById("status");
     const audio = document.getElementById("audio");
     let roomRef = null;
+
+    function syncMediaSessionPlaying() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        navigator.mediaSession.playbackState = audio.paused ? "paused" : "playing";
+      }} catch (_) {{}}
+    }}
+
+    function ensureMediaSessionMetadata() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        navigator.mediaSession.metadata = new MediaMetadata({{
+          title: "Прямая трансляция",
+          artist: "LiveKit",
+          album: document.getElementById("room").value || "audio-room",
+        }});
+      }} catch (_) {{}}
+    }}
+
+    audio.addEventListener("play", () => {{
+      syncMediaSessionPlaying();
+      ensureMediaSessionMetadata();
+    }});
+    audio.addEventListener("pause", syncMediaSessionPlaying);
+
+    document.addEventListener("visibilitychange", () => {{
+      if (document.hidden || !roomRef) return;
+      ensureMediaSessionMetadata();
+      syncMediaSessionPlaying();
+      roomRef.startAudio().catch(() => {{}});
+      audio.play().catch(() => {{}});
+    }});
 
     joinBtn.addEventListener("click", async () => {{
       try {{
@@ -127,11 +160,18 @@ async def index(request: web.Request) -> web.Response:
         if (!tokenJson.token) {{
           throw new Error(tokenJson.error || "ответ без token");
         }}
-        const lkRoom = new Room();
+        const lkRoom = new Room({{
+          disconnectOnPageLeave: false,
+          adaptiveStream: false,
+          dynacast: false,
+          webAudioMix: false,
+        }});
         function attachIfAudio(track) {{
           if (track && track.kind === "audio") {{
             track.attach(audio);
             status.textContent = "audio subscribed";
+            ensureMediaSessionMetadata();
+            audio.play().catch(() => {{}});
           }}
         }}
         lkRoom.on("trackSubscribed", (track) => attachIfAudio(track));
