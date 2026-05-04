@@ -1,6 +1,6 @@
 import platform
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Tuple
 
 import sounddevice as sd
 
@@ -14,47 +14,12 @@ class AudioInputDevice:
     default_sample_rate: int
 
 
-def _list_windows_loopback_soundcard() -> List[AudioInputDevice]:
-    """WASAPI loopback (звук с экрана / колонок / выбранного выхода). Только Windows + soundcard."""
-    try:
-        import soundcard as sc  # type: ignore[import-untyped]
-    except Exception:
-        return []
-    if platform.system().lower() == "windows":
-        try:
-            from win_com import ensure_com_initialized
-
-            ensure_com_initialized()
-        except OSError:
-            return []
-    out: List[AudioInputDevice] = []
-    try:
-        mics = sc.all_microphones(include_loopback=True)
-    except Exception:
-        return []
-    for idx, m in enumerate(mics):
-        if not getattr(m, "isloopback", False):
-            continue
-        out.append(
-            AudioInputDevice(
-                device_id=f"sc_lb:{idx}",
-                name=f"Звук с экрана: {m.name}",
-                backend="WASAPI loopback",
-                max_input_channels=int(getattr(m, "channels", 2) or 2),
-                default_sample_rate=48000,
-            )
-        )
-    return out
-
-
-def list_input_devices() -> List[AudioInputDevice]:
+def list_microphone_devices_only() -> List[AudioInputDevice]:
+    """Только физические/виртуальные входы PortAudio (микрофоны и т.д.)."""
     devices = sd.query_devices()
     host_apis = sd.query_hostapis()
     result: List[AudioInputDevice] = []
     os_name = platform.system().lower()
-
-    if "windows" in os_name:
-        result.extend(_list_windows_loopback_soundcard())
 
     for idx, dev in enumerate(devices):
         max_input = int(dev.get("max_input_channels", 0))
@@ -80,4 +45,66 @@ def list_input_devices() -> List[AudioInputDevice]:
             )
         )
 
+    return result
+
+
+def list_windows_loopback_devices() -> Tuple[List[AudioInputDevice], Optional[str]]:
+    """
+    WASAPI loopback (soundcard). Возвращает (список, текст ошибки если список пуст).
+    Сначала import soundcard — на главном потоке поднимает COM внутри soundcard.
+    """
+    if platform.system().lower() != "windows":
+        return [], None
+    try:
+        import soundcard as sc  # type: ignore[import-untyped]
+    except Exception as e:
+        return [], f"soundcard: {e}"
+
+    try:
+        from win_com import ensure_com_initialized
+
+        ensure_com_initialized()
+    except OSError as e:
+        # часто COM уже поднят soundcard; перечисление всё равно пробуем
+        _com_warn = str(e)
+    else:
+        _com_warn = None
+
+    out: List[AudioInputDevice] = []
+    try:
+        mics = sc.all_microphones(include_loopback=True)
+    except Exception as e:
+        msg = f"{e}"
+        if _com_warn:
+            msg = f"{_com_warn}; {msg}"
+        return [], msg
+
+    for idx, m in enumerate(mics):
+        if not getattr(m, "isloopback", False):
+            continue
+        out.append(
+            AudioInputDevice(
+                device_id=f"sc_lb:{idx}",
+                name=m.name,
+                backend="WASAPI loopback",
+                max_input_channels=int(getattr(m, "channels", 2) or 2),
+                default_sample_rate=48000,
+            )
+        )
+
+    if not out:
+        hint = "В системе не найдены loopback-устройства (запись выхода). Установите soundcard, проверьте драйверы."
+        if _com_warn:
+            hint = f"{_com_warn}. {hint}"
+        return [], hint
+    return out, None
+
+
+def list_input_devices() -> List[AudioInputDevice]:
+    """Объединённый список (совместимость): Windows — loopback сверху, затем микрофоны."""
+    result: List[AudioInputDevice] = []
+    if platform.system().lower() == "windows":
+        lb, _ = list_windows_loopback_devices()
+        result.extend(lb)
+    result.extend(list_microphone_devices_only())
     return result

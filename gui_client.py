@@ -15,9 +15,16 @@ from urllib.error import HTTPError, URLError
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable
 
+import platform
+
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-from audio_devices import list_input_devices, AudioInputDevice
+from audio_devices import (
+    AudioInputDevice,
+    list_input_devices,
+    list_microphone_devices_only,
+    list_windows_loopback_devices,
+)
 from livekit_client import LiveKitStreamClient, LiveKitState
 from env_loader import load_env_files
 
@@ -636,13 +643,15 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Audio Streamer (LiveKit)")
-        self.geometry("860x530")
+        self.geometry("860x580")
         self.resizable(False, False)
 
         self.legacy_client = StreamClient(self.on_state_update)
         self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update)
         self.transport_values = ["LiveKit (native)"] + (["Legacy WS+FFmpeg"] if ENABLE_LEGACY_TRANSPORT else [])
         self.input_devices: List[AudioInputDevice] = []
+        self.loopback_devices: List[AudioInputDevice] = []
+        self.mic_devices: List[AudioInputDevice] = []
 
         pad = {"padx": 8, "pady": 6}
         frm = ttk.Frame(self)
@@ -680,11 +689,52 @@ class App(tk.Tk):
         self.entry_pairing_secret = ttk.Entry(frm, textvariable=self.var_pairing_secret, width=50, show="*")
         self.entry_pairing_secret.grid(row=4, column=1, sticky="we", **pad, columnspan=3)
 
-        # Device
-        ttk.Label(frm, text="Источник аудио:").grid(row=5, column=0, sticky="w", **pad)
-        self.var_device = tk.StringVar()
-        self.combo_device = ttk.Combobox(frm, state="readonly", width=55)
-        self.combo_device.grid(row=5, column=1, sticky="we", **pad, columnspan=3)
+        # Источник: на Windows + LiveKit — отдельно «системный звук» (sc_lb) и микрофон (цифры PortAudio)
+        self.var_win_route = tk.StringVar(value="system")
+        self.frm_audio = ttk.LabelFrame(frm, text="Источник для трансляции")
+        self.frm_audio.grid(row=5, column=0, columnspan=4, sticky="ew", padx=8, pady=6)
+
+        self.frm_audio_win = ttk.Frame(self.frm_audio)
+        self.frm_audio_simple = ttk.Frame(self.frm_audio)
+        pad_a = {"padx": 8, "pady": 4}
+        ttk.Radiobutton(
+            self.frm_audio_win,
+            text="Системный звук (Spotify, браузер, игры) — не микрофон",
+            variable=self.var_win_route,
+            value="system",
+            command=self._on_win_audio_mode,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", **pad_a)
+        ttk.Radiobutton(
+            self.frm_audio_win,
+            text="Микрофон",
+            variable=self.var_win_route,
+            value="mic",
+            command=self._on_win_audio_mode,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", **pad_a)
+        ttk.Label(
+            self.frm_audio_win,
+            text="Запись выхода (наушники/колонки = тот же вывод, куда играет музыка):",
+        ).grid(row=2, column=0, sticky="nw", **pad_a)
+        self.combo_win_loopback = ttk.Combobox(self.frm_audio_win, state="readonly", width=68)
+        self.combo_win_loopback.grid(row=2, column=1, sticky="we", **pad_a)
+        ttk.Label(self.frm_audio_win, text="Микрофон:").grid(row=3, column=0, sticky="nw", **pad_a)
+        self.combo_win_mic = ttk.Combobox(self.frm_audio_win, state="readonly", width=68)
+        self.combo_win_mic.grid(row=3, column=1, sticky="we", **pad_a)
+        self.lbl_loopback_hint = ttk.Label(
+            self.frm_audio_win,
+            text="",
+            foreground="#555",
+            wraplength=760,
+            justify="left",
+        )
+        self.lbl_loopback_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0), padx=8)
+        self.frm_audio_win.columnconfigure(1, weight=1)
+
+        ttk.Label(self.frm_audio_simple, text="Устройство:").grid(row=0, column=0, sticky="w", **pad_a)
+        self.combo_device = ttk.Combobox(self.frm_audio_simple, state="readonly", width=68)
+        self.combo_device.grid(row=0, column=1, sticky="we", **pad_a)
+        self.frm_audio_simple.columnconfigure(1, weight=1)
+        self.frm_audio.columnconfigure(0, weight=1)
 
         # Create/Delete virtual device (PulseAudio only)
         self.btn_create = ttk.Button(frm, text="Создать виртуальное устройство", command=self.on_create_vdev)
@@ -749,21 +799,61 @@ class App(tk.Tk):
         self.btn_create.config(state="disabled" if is_livekit else "normal")
         self.btn_delete.config(state="disabled" if is_livekit else "normal")
         self.on_refresh_devices()
+        self._update_audio_panel_visibility()
+
+    def _update_audio_panel_visibility(self) -> None:
+        lk = self.var_transport.get() == "LiveKit (native)"
+        win = platform.system().lower() == "windows"
+        self.frm_audio_win.pack_forget()
+        self.frm_audio_simple.pack_forget()
+        if lk and win:
+            self.frm_audio_win.pack(fill="x", padx=4, pady=4)
+        else:
+            self.frm_audio_simple.pack(fill="x", padx=4, pady=4)
+
+    def _on_win_audio_mode(self) -> None:
+        if self.var_win_route.get() == "system":
+            self.combo_win_loopback.configure(state="readonly")
+            self.combo_win_mic.configure(state="disabled")
+        else:
+            self.combo_win_loopback.configure(state="disabled")
+            self.combo_win_mic.configure(state="readonly")
 
     def on_refresh_devices(self):
         if self.var_transport.get() == "LiveKit (native)":
+            self.mic_devices = list_microphone_devices_only()
+            self.loopback_devices, lb_err = list_windows_loopback_devices()
             self.input_devices = list_input_devices()
-            values = []
-            for d in self.input_devices:
-                if str(d.device_id).startswith("sc_lb:"):
-                    values.append(
-                        f"{d.device_id} — Системный звук (не микрофон): {d.name} [{d.backend}]"
+
+            if platform.system().lower() == "windows":
+                self.combo_win_loopback["values"] = [
+                    f"{d.device_id} — {d.name} ({d.backend})" for d in self.loopback_devices
+                ]
+                self.combo_win_mic["values"] = [
+                    f"{d.device_id} — {d.name} [{d.backend}]" for d in self.mic_devices
+                ]
+                if self.loopback_devices:
+                    self.combo_win_loopback.current(0)
+                if self.mic_devices:
+                    self.combo_win_mic.current(0)
+                if lb_err and not self.loopback_devices:
+                    self.lbl_loopback_hint.config(text=lb_err)
+                elif self.loopback_devices:
+                    self.lbl_loopback_hint.config(
+                        text="Важно: только строки с префиксом sc_lb: — запись из Windows (наушники/HDMI). "
+                        "Числа 0, 9, 23 без sc_lb: — это микрофоны, не Spotify."
                     )
                 else:
-                    values.append(f"{d.device_id} — {d.name} [{d.backend}]")
-            self.combo_device["values"] = values
-            if values:
-                self.combo_device.current(0)
+                    self.lbl_loopback_hint.config(
+                        text="Loopback не найден. Проверьте: pip install soundcard. Для Spotify выберите выход "
+                        "совпадающий с «Параметры звука → вывод»."
+                    )
+                self._on_win_audio_mode()
+            else:
+                values = [f"{d.device_id} — {d.name} [{d.backend}]" for d in self.input_devices]
+                self.combo_device["values"] = values
+                if values:
+                    self.combo_device.current(0)
         else:
             self.pulse_sources = list_pulse_sources()
             values = [f"{i} — {l}" for i, l in self.pulse_sources]
@@ -788,10 +878,6 @@ class App(tk.Tk):
             return
 
         if self.var_transport.get() == "LiveKit (native)":
-            dev_idx = self.combo_device.current()
-            if not self.input_devices:
-                messagebox.showerror("Ошибка", "Не найдено устройств ввода.")
-                return
             pairing_secret = self.var_pairing_secret.get().strip()
             room = self.var_room.get().strip()
             identity = self.var_identity.get().strip()
@@ -811,7 +897,42 @@ class App(tk.Tk):
                     identity=identity,
                     pairing_secret=pairing_secret,
                 )
-                device = self.input_devices[dev_idx] if (0 <= dev_idx < len(self.input_devices)) else self.input_devices[0]
+                if platform.system().lower() == "windows":
+                    if self.var_win_route.get() == "system":
+                        if not self.loopback_devices:
+                            messagebox.showerror(
+                                "Системный звук недоступен",
+                                "Список «Запись выхода» пуст — захват Spotify/игр через LiveKit невозможен.\n\n"
+                                "Установите пакет: pip install soundcard\n"
+                                "Перезапустите клиент и нажмите «Обновить источники».\n\n"
+                                "В трансляции должны быть строки вида sc_lb:N — это не то же самое, что пункты 0 или 9 "
+                                "из списка микрофонов.",
+                            )
+                            return
+                        li = self.combo_win_loopback.current()
+                        if li < 0 or li >= len(self.loopback_devices):
+                            messagebox.showerror("Ошибка", "Выберите выход для системного звука (sc_lb:…).")
+                            return
+                        device = self.loopback_devices[li]
+                    else:
+                        if not self.mic_devices:
+                            messagebox.showerror("Ошибка", "Не найдено микрофонов.")
+                            return
+                        mi = self.combo_win_mic.current()
+                        if mi < 0 or mi >= len(self.mic_devices):
+                            messagebox.showerror("Ошибка", "Выберите микрофон.")
+                            return
+                        device = self.mic_devices[mi]
+                else:
+                    dev_idx = self.combo_device.current()
+                    if not self.input_devices:
+                        messagebox.showerror("Ошибка", "Не найдено устройств ввода.")
+                        return
+                    device = (
+                        self.input_devices[dev_idx]
+                        if (0 <= dev_idx < len(self.input_devices))
+                        else self.input_devices[0]
+                    )
                 self.livekit_client.start(
                     server_url=server_lk,
                     token=token,
