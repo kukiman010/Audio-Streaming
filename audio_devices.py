@@ -20,8 +20,19 @@ def _list_windows_loopback_soundcard() -> List[AudioInputDevice]:
         import soundcard as sc  # type: ignore[import-untyped]
     except Exception:
         return []
+    if platform.system().lower() == "windows":
+        try:
+            from win_com import ensure_com_initialized
+
+            ensure_com_initialized()
+        except OSError:
+            return []
     out: List[AudioInputDevice] = []
-    for idx, m in enumerate(sc.all_microphones(include_loopback=True)):
+    try:
+        mics = sc.all_microphones(include_loopback=True)
+    except Exception:
+        return []
+    for idx, m in enumerate(mics):
         if not getattr(m, "isloopback", False):
             continue
         out.append(

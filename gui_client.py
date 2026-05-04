@@ -753,7 +753,14 @@ class App(tk.Tk):
     def on_refresh_devices(self):
         if self.var_transport.get() == "LiveKit (native)":
             self.input_devices = list_input_devices()
-            values = [f"{d.device_id} — {d.name} [{d.backend}]" for d in self.input_devices]
+            values = []
+            for d in self.input_devices:
+                if str(d.device_id).startswith("sc_lb:"):
+                    values.append(
+                        f"{d.device_id} — Системный звук (не микрофон): {d.name} [{d.backend}]"
+                    )
+                else:
+                    values.append(f"{d.device_id} — {d.name} [{d.backend}]")
             self.combo_device["values"] = values
             if values:
                 self.combo_device.current(0)

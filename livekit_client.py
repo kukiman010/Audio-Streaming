@@ -23,16 +23,17 @@ class LiveKitState:
 UpdateCallback = Callable[[LiveKitState], None]
 
 
-def _soundcard_loopback_device_by_index(index: int):
+def _validate_sc_loopback_index(index: int) -> None:
+    """Проверка индекса sc_lb:N до старта потока; COM и объекты soundcard — в своём потоке."""
     import soundcard as sc  # type: ignore[import-untyped]
+    from win_com import ensure_com_initialized
 
+    ensure_com_initialized()
     all_m = sc.all_microphones(include_loopback=True)
     if not (0 <= index < len(all_m)):
         raise IndexError("Нет устройства с таким индексом (soundcard).")
-    dev = all_m[index]
-    if not getattr(dev, "isloopback", False):
+    if not getattr(all_m[index], "isloopback", False):
         raise ValueError("Указанный индекс не является loopback-устройством.")
-    return dev
 
 
 def _is_soundcard_loopback_id(device_id: Optional[str]) -> bool:
@@ -89,7 +90,7 @@ class LiveKitStreamClient:
                     await self.stop()
                     return
                 try:
-                    sc_mic = _soundcard_loopback_device_by_index(lb_index)
+                    _validate_sc_loopback_index(lb_index)
                 except Exception as e:
                     self.state.last_error = f"Устройство loopback: {e}"
                     await self.stop()
@@ -101,7 +102,13 @@ class LiveKitStreamClient:
                 frame_samples = max(1, int(sample_rate) // 100)
 
                 def _loopback_worker() -> None:
+                    import soundcard as sc  # type: ignore[import-untyped]
+                    from win_com import ensure_com_initialized
+
                     try:
+                        ensure_com_initialized()
+                        all_m = sc.all_microphones(include_loopback=True)
+                        sc_mic = all_m[lb_index]
                         ch = min(int(sc_mic.channels), 2)
                         with sc_mic.recorder(int(sample_rate), channels=ch) as rec:
                             while self._stop_event and not self._stop_event.is_set():
