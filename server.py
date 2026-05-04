@@ -82,7 +82,7 @@ async def index(request: web.Request) -> web.Response:
     input, button {{ padding: 8px; margin: 4px 0; width: 100%; box-sizing: border-box; }}
     .status {{ margin-top: 8px; color: #444; white-space: pre-wrap; }}
     .hint {{ font-size: 0.9rem; color: #555; margin: 0.5rem 0 1rem; line-height: 1.4; }}
-    .webrtc-player {{ width: 100%; max-height: 140px; background: #111; border-radius: 8px; }}
+    .stream-audio {{ width: 100%; margin-top: 0.5rem; min-height: 48px; }}
   </style>
 </head>
 <body>
@@ -92,7 +92,7 @@ async def index(request: web.Request) -> web.Response:
       <strong>LiveKit WS URL</strong> — адрес сигнального WebSocket (порт обычно 7880). Значение по умолчанию подставляется из LIVEKIT_URL или из имени хоста этой страницы.
       С другого ПК/телефона нельзя оставлять <code>127.0.0.1</code> — укажите IP или имя машины, где запущен LiveKit.
       Страница открыта по HTTPS — нужен <code>wss://</code> и TLS на стороне LiveKit (иначе браузер блокирует «небезопасный» ws).
-      Раньше часто делали поток по HTTP (например MP3) и подключали его как <code>&lt;audio src="…"&gt;</code> — Chromium считает это обычным «URL‑плеером». Здесь звук приходит по WebRTC (<code>MediaStream</code>) из LiveKit — это другой внутренний путь. Для вывода используется <code>&lt;video playsinline&gt;</code>: только аудио без картинки (чёрная область), но на Android Chrome обычно срабатывают те же механизмы, что и у нормального медиа в плеере (уведомление, фон). Соединение не рвётся при уходе со страницы в SDK.
+      Звук — WebRTC (<code>MediaStream</code> в LiveKit), не прогрессивный MP3 по URL: внешне у <code>&lt;audio controls&gt;</code> привычный плеер внизу элемента; мини‑плеер в шторке/на экране блокировки зависит от ОС и Media Session. Нужен актуальный <code>server.py</code> на машине: одного перезапуска процесса без выкладки кода мало. Соединение с комнатой не рвётся при уходе со страницы (в SDK отключено авто‑отключение).
     </p>
     <label>LiveKit WS URL</label>
     <input id="url" value="{default_lk}" />
@@ -102,7 +102,7 @@ async def index(request: web.Request) -> web.Response:
     <input id="identity" value="web-viewer" />
     <button id="join">Join room</button>
     <div class="status" id="status">offline</div>
-    <video id="player" class="webrtc-player" playsinline webkit-playsinline autoplay controls></video>
+    <audio id="player" class="stream-audio" controls playsinline preload="none"></audio>
   </div>
   <script type="module">
     import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
