@@ -8,7 +8,6 @@ from pathlib import Path
 from aiohttp import web
 import livekit.api as api
 from env_loader import load_env_files
-from listen_relay import handle_listen_mp3
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -70,84 +69,506 @@ async def client_discovery(request: web.Request) -> web.Response:
 
 
 async def index(request: web.Request) -> web.Response:
-    base = html.escape(helper_public_base_url(request), quote=True)
-    lk_hint = html.escape(_default_livekit_ws_url(request), quote=True)
+    default_lk = html.escape(_default_livekit_ws_url(request), quote=True)
     page = f"""<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Listen — LiveKit</title>
+  <title>LiveKit Audio Viewer</title>
   <style>
-    body {{ font-family: sans-serif; margin: 1rem; max-width: 720px; margin-left: auto; margin-right: auto; }}
-    .card {{ padding: 1rem; border: 1px solid #ddd; border-radius: 12px; }}
-    input, button {{ padding: 10px; margin: 6px 0; width: 100%; box-sizing: border-box; }}
-    .hint {{ font-size: 0.88rem; color: #444; line-height: 1.45; margin: 0.75rem 0; }}
-    audio {{ width: 100%; min-height: 54px; }}
-    code {{ word-break: break-all; }}
-    .ok {{ color: #15803d; }}
+    body {{ font-family: sans-serif; margin: 2rem; }}
+    .card {{ max-width: 800px; margin: 0 auto; padding: 1rem; border: 1px solid #ddd; border-radius: 10px; }}
+    input, button {{ padding: 8px; margin: 4px 0; width: 100%; box-sizing: border-box; }}
+    .status {{ margin-top: 8px; color: #444; white-space: pre-wrap; }}
+    .hint {{ font-size: 0.9rem; color: #555; margin: 0.5rem 0 1rem; line-height: 1.4; }}
+    /* Нативные controls у WebRTC audio на Android часто не показываются — свой интерфейс. */
+    #player {{
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0,0,0,0); border: 0;
+    }}
+    .player-shell {{
+      margin-top: 16px; padding: 14px; border: 3px solid #2563eb; border-radius: 12px;
+      background: #eff6ff; display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+      box-sizing: border-box;
+    }}
+    @media (max-width: 640px) {{
+      .player-shell {{
+        position: sticky; bottom: 8px; z-index: 50;
+        box-shadow: 0 -6px 18px rgba(37, 99, 235, 0.15);
+      }}
+    }}
+    .player-shell-head {{
+      flex: 1 1 100%; margin: 0 0 4px 0; font-size: 1.15rem; color: #1e3a8a;
+    }}
+    .sdk-err {{
+      flex: 1 1 100%; padding: 10px; background: #fee2e2; border-radius: 8px; color: #991b1b; font-size: 0.9rem;
+    }}
+    .player-shell .btn-main {{
+      flex: 1 1 auto; min-height: 52px; font-size: 1.15rem; font-weight: 700;
+      padding: 14px 18px; margin: 0; width: auto !important;
+      background: #2563eb; color: #fff; border: none; border-radius: 10px;
+    }}
+    .player-shell .btn-main:disabled {{
+      background: #94a3b8; color: #f1f5f9;
+    }}
+    .player-shell .live-label {{ flex: 1 1 100%; font-size: 0.95rem; color: #334155; line-height: 1.35; }}
+    #tapToPlay {{ display: none; margin-top: 12px; padding: 12px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; }}
+    #tapToPlay.show {{ display: block; }}
+    #tapToPlayBtn {{ font-size: 1.05rem; font-weight: 600; }}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Прослушивание эфира</h2>
+    <h2>LiveKit Audio Viewer</h2>
     <p class="hint">
-      Звук идёт как обычный <strong>HTTP‑поток MP3</strong> (<code>/listen.mp3</code>) — так браузер включает
-      встроенный плеер и медиа‑сессию, как у музыки по ссылке.
-      На сервере helper нужны <strong>ffmpeg</strong> и <code>LIVEKIT_API_KEY</code> / <code>LIVEKIT_API_SECRET</code>.
-      Ведущий публикует в LiveKit через GUI‑клиент; эта страница только слушает комнату.
+      <strong>LiveKit WS URL</strong> — адрес сигнального WebSocket (порт обычно 7880). Значение по умолчанию подставляется из LIVEKIT_URL или из имени хоста этой страницы.
+      С другого ПК/телефона нельзя оставлять <code>127.0.0.1</code> — укажите IP или имя машины, где запущен LiveKit.
+      Страница открыта по HTTPS — нужен <code>wss://</code> и TLS на стороне LiveKit (иначе браузер блокирует «небезопасный» ws).
+      Звук — WebRTC (<code>MediaStream</code>). На телефоне браузер часто <strong>не рисует стандартную полоску плеера</strong> для такого потока — используйте большую кнопку «Слушать» ниже. Шторка уведомлений — через <strong>Media Session</strong>. Полная работа при заблокированном экране без приложения не гарантируется. Нужен актуальный <code>server.py</code>. Соединение с комнатой не рвётся при уходе со страницы (в SDK отключено авто‑отключение).
     </p>
-    <label>Комната (room)</label>
-    <input id="room" value="audio-room" autocomplete="off" />
-    <button type="button" id="play">Слушать эфир</button>
-    <p class="hint ok">Плеер ниже — стандартный элемент <code>&lt;audio controls&gt;</code>. Если ошибка: запустите трансляцию и нажмите снова.</p>
-    <audio id="player" controls playsinline preload="none"></audio>
-    <div class="status" id="status" style="margin-top:10px;color:#555;font-size:0.9rem;white-space:pre-wrap;">offline</div>
-    <p class="hint">
-      Прямая ссылка: <code>{base}/listen.mp3?room=audio-room</code><br />
-      LiveKit WS (для стримера): <code>{lk_hint}</code>
-    </p>
+    <label>LiveKit WS URL</label>
+    <input id="url" value="{default_lk}" />
+    <label>Room</label>
+    <input id="room" value="audio-room" />
+    <label>Identity</label>
+    <input id="identity" value="web-viewer" />
+    <button id="join">Join room</button>
+    <div id="playerShell" class="player-shell">
+      <div class="player-shell-head"><strong>Плеер эфира</strong> — большая синяя кнопка ниже (не полоска браузера).</div>
+      <div id="sdkLoadError" class="sdk-err" hidden></div>
+      <button type="button" id="btnPlayPause" class="btn-main" disabled>Слушать</button>
+      <span id="liveLabel" class="live-label">Сначала нажмите «Join room», затем дождитесь эфира.</span>
+    </div>
+    <div class="status" id="status">offline</div>
+    <div id="tapToPlay" aria-live="polite">
+      <button type="button" id="tapToPlayBtn">Включить звук</button>
+      <p class="hint" style="margin: 8px 0 0;">Если эфир начался после входа в комнату, браузер на телефоне мог заблокировать автозвук — нажмите кнопку выше.</p>
+    </div>
+    <!-- Отдельный элемент только для «прогрева» жеста — не смешивать с WebRTC (Chrome Android). -->
+    <audio id="primeSilent" preload="auto" playsinline style="display:none;width:0;height:0;position:absolute;visibility:hidden" aria-hidden="true"></audio>
+    <audio id="player" preload="none" playsinline></audio>
   </div>
-  <script>
-  (function () {{
-    var player = document.getElementById("player");
-    var roomEl = document.getElementById("room");
-    var statusEl = document.getElementById("status");
-    document.getElementById("play").addEventListener("click", function () {{
-      var room = (roomEl && roomEl.value) ? roomEl.value.trim() : "audio-room";
-      var u = new URL("/listen.mp3", window.location.origin);
-      u.searchParams.set("room", room);
-      player.src = u.toString();
-      statusEl.textContent = "Запрос потока…";
-      player.play().catch(function (e) {{ statusEl.textContent = "play: " + e; }});
+  <script type="module">
+(async () => {{
+  let Room;
+  try {{
+    let mod;
+    try {{
+      mod = await import("https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs");
+    }} catch (e1) {{
+      mod = await import("https://unpkg.com/livekit-client@2/dist/livekit-client.esm.mjs");
+    }}
+    Room = mod.Room;
+  }} catch (e) {{
+    const st = document.getElementById("status");
+    const banner = document.getElementById("sdkLoadError");
+    const msg =
+      "Не удалось загрузить LiveKit SDK (пробовали cdn.jsdelivr.net и unpkg.com). Проверьте интернет и блокировщики. Ошибка: "
+      + ((e && e.message) ? e.message : String(e));
+    if (st) st.textContent = msg;
+    if (banner) {{
+      banner.hidden = false;
+      banner.textContent = msg;
+    }}
+    return;
+  }}
+
+    const joinBtn = document.getElementById("join");
+    const status = document.getElementById("status");
+    const player = document.getElementById("player");
+    const tapToPlayEl = document.getElementById("tapToPlay");
+    const tapToPlayBtn = document.getElementById("tapToPlayBtn");
+    const primeSilent = document.getElementById("primeSilent");
+    const playerShell = document.getElementById("playerShell");
+    const btnPlayPause = document.getElementById("btnPlayPause");
+    const liveLabel = document.getElementById("liveLabel");
+    if (!joinBtn || !player || !btnPlayPause) {{
+      if (status) status.textContent = "Ошибка страницы: обновите с принудительным сбросом кэша (Ctrl+F5).";
+      return;
+    }}
+    let roomRef = null;
+    let resumeAfterSuspendTimer = null;
+    let mediaSessionKeepAlive = null;
+    /** Минимальный WAV — синхронное воспроизведение в том же тике, что и tap (iOS / автозапуск). */
+    const SILENT_WAV_DATA_URI =
+      "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+
+    try {{
+      player.setAttribute("playsinline", "");
+      player.playsInline = true;
+    }} catch (_) {{}}
+
+    function updatePlayChrome() {{
+      const connected = !!roomRef;
+      const hasStream =
+        connected && !!(player.srcObject && player.srcObject.getAudioTracks().length > 0);
+      if (btnPlayPause) {{
+        btnPlayPause.disabled = !hasStream;
+        if (!hasStream) {{
+          btnPlayPause.textContent = connected ? "Ждём эфир…" : "Слушать";
+        }} else if (player.paused) {{
+          btnPlayPause.textContent = "Слушать";
+        }} else {{
+          btnPlayPause.textContent = "Пауза";
+        }}
+        btnPlayPause.setAttribute("aria-pressed", !player.paused && hasStream ? "true" : "false");
+      }}
+      if (liveLabel) {{
+        if (!connected) liveLabel.textContent = "Сначала нажмите «Join room».";
+        else if (!hasStream) liveLabel.textContent = "Подключено. Когда ведущий начнёт эфир, нажмите «Слушать».";
+        else if (player.paused) liveLabel.textContent = "На паузе.";
+        else liveLabel.textContent = "Идёт воспроизведение.";
+      }}
+    }}
+
+    function stopPrimeSilent() {{
+      if (!primeSilent) return;
+      try {{
+        primeSilent.pause();
+        primeSilent.loop = false;
+        primeSilent.removeAttribute("src");
+        primeSilent.srcObject = null;
+        primeSilent.src = "";
+      }} catch (_) {{}}
+    }}
+
+    function syncMediaSessionPositionState() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        if (player.paused || !player.srcObject) {{
+          navigator.mediaSession.setPositionState(null);
+          return;
+        }}
+        navigator.mediaSession.setPositionState({{
+          duration: Number.MAX_SAFE_INTEGER,
+          playbackRate: 1,
+          position: 0,
+        }});
+      }} catch (_) {{}}
+    }}
+
+    function showTapToPlay() {{
+      if (tapToPlayEl) tapToPlayEl.classList.add("show");
+    }}
+    function hideTapToPlay() {{
+      if (tapToPlayEl) tapToPlayEl.classList.remove("show");
+    }}
+
+    /**
+     * Должно вызываться синхронно из обработчика клика (до первого await).
+     * Отдельный скрытый &lt;audio&gt; — не трогать основной плеер с WebRTC (Chrome Android).
+     */
+    function primeAudioElementInGesture() {{
+      try {{
+        if (!primeSilent) return;
+        primeSilent.pause();
+        primeSilent.removeAttribute("src");
+        primeSilent.srcObject = null;
+        primeSilent.src = SILENT_WAV_DATA_URI;
+        primeSilent.loop = true;
+        primeSilent.muted = true;
+        primeSilent.volume = 0;
+        const pr = primeSilent.play();
+        if (pr && typeof pr.then === "function") pr.catch(() => {{}});
+      }} catch (_) {{}}
+    }}
+
+    function preparePlayerForLiveTrack() {{
+      try {{
+        player.loop = false;
+        player.muted = false;
+        player.volume = 1;
+        player.removeAttribute("src");
+        player.src = "";
+      }} catch (_) {{}}
+    }}
+
+    async function unlockPlaybackAfterAttach(room) {{
+      const r = room || roomRef;
+      if (!r) return;
+      try {{
+        await r.startAudio();
+      }} catch (_) {{}}
+      try {{
+        await player.play();
+        hideTapToPlay();
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
+      }} catch (_) {{
+        showTapToPlay();
+      }}
+      updatePlayChrome();
+    }}
+
+    btnPlayPause.addEventListener("click", async () => {{
+      try {{
+        if (roomRef) await roomRef.startAudio();
+      }} catch (_) {{}}
+      try {{
+        if (!player.srcObject) return;
+        player.muted = false;
+        if (player.volume === 0) player.volume = 1;
+        if (player.paused) {{
+          await player.play();
+          hideTapToPlay();
+        }} else {{
+          player.pause();
+        }}
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
+      }} catch (_) {{
+        showTapToPlay();
+      }}
+      updatePlayChrome();
     }});
-    player.addEventListener("playing", function () {{ statusEl.textContent = "Воспроизведение (MP3)"; }});
-    player.addEventListener("error", function () {{
-      statusEl.textContent = "Ошибка /listen.mp3 (часто 503: нет эфира в комнате или нет ffmpeg на сервере).";
+
+    if (tapToPlayBtn) tapToPlayBtn.addEventListener("click", async () => {{
+      try {{
+        if (roomRef) await roomRef.startAudio();
+      }} catch (_) {{}}
+      try {{
+        player.muted = false;
+        if (player.volume === 0) player.volume = 1;
+        await player.play();
+        hideTapToPlay();
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
+      }} catch (_) {{
+        showTapToPlay();
+      }}
+      updatePlayChrome();
     }});
-  }})();
+
+    window.addEventListener("focus", () => {{
+      if (!roomRef || !player.srcObject) return;
+      if (player.paused) {{
+        roomRef.startAudio().catch(() => {{}});
+        player.play().catch(() => {{ showTapToPlay(); }});
+      }}
+      updatePlayChrome();
+    }});
+
+    window.addEventListener("pageshow", (ev) => {{
+      if (!ev.persisted || !roomRef || !player.srcObject) return;
+      roomRef.startAudio().catch(() => {{}});
+      player.play().catch(() => {{}});
+      updatePlayChrome();
+    }});
+
+    player.addEventListener("pause", () => {{
+      syncMediaSessionPlaying();
+      updatePlayChrome();
+      clearTimeout(resumeAfterSuspendTimer);
+      resumeAfterSuspendTimer = setTimeout(() => {{
+        try {{
+          if (!roomRef || !player.srcObject) return;
+          if (!document.hidden) return;
+          if (!player.paused) return;
+          roomRef.startAudio().catch(() => {{}});
+          player.play().catch(() => {{}});
+          updatePlayChrome();
+        }} catch (_) {{}}
+      }}, 120);
+    }});
+
+    function wireMediaSessionControls() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        navigator.mediaSession.setActionHandler("play", () => {{
+          player.play().catch(() => {{}});
+          syncMediaSessionPlaying();
+          updatePlayChrome();
+        }});
+        navigator.mediaSession.setActionHandler("pause", () => {{
+          player.pause();
+          syncMediaSessionPlaying();
+          updatePlayChrome();
+        }});
+        navigator.mediaSession.setActionHandler("stop", () => {{
+          player.pause();
+          syncMediaSessionPlaying();
+          updatePlayChrome();
+        }});
+      }} catch (_) {{}}
+    }}
+
+    function syncMediaSessionPlaying() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        navigator.mediaSession.playbackState = player.paused ? "paused" : "playing";
+        syncMediaSessionPositionState();
+      }} catch (_) {{}}
+    }}
+
+    function ensureMediaSessionMetadata() {{
+      if (!("mediaSession" in navigator)) return;
+      try {{
+        navigator.mediaSession.metadata = new MediaMetadata({{
+          title: "Прямая трансляция",
+          artist: "LiveKit",
+          album: document.getElementById("room").value || "audio-room",
+        }});
+      }} catch (_) {{}}
+    }}
+
+    function startMediaSessionKeepAlive() {{
+      if (mediaSessionKeepAlive) clearInterval(mediaSessionKeepAlive);
+      mediaSessionKeepAlive = setInterval(() => {{
+        if (!roomRef || player.paused) return;
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
+      }}, 15000);
+    }}
+
+    function stopMediaSessionKeepAlive() {{
+      if (mediaSessionKeepAlive) {{
+        clearInterval(mediaSessionKeepAlive);
+        mediaSessionKeepAlive = null;
+      }}
+    }}
+
+    wireMediaSessionControls();
+
+    player.addEventListener("playing", () => {{
+      ensureMediaSessionMetadata();
+      syncMediaSessionPlaying();
+      updatePlayChrome();
+    }});
+    player.addEventListener("play", () => {{
+      syncMediaSessionPlaying();
+      ensureMediaSessionMetadata();
+      updatePlayChrome();
+    }});
+
+    document.addEventListener("visibilitychange", () => {{
+      if (!roomRef) return;
+      if (document.hidden) {{
+        if (!player.paused) {{
+          ensureMediaSessionMetadata();
+          syncMediaSessionPlaying();
+        }}
+        return;
+      }}
+      ensureMediaSessionMetadata();
+      syncMediaSessionPlaying();
+      roomRef.startAudio().catch(() => {{}});
+      player.play().catch(() => {{ showTapToPlay(); }});
+      updatePlayChrome();
+    }});
+
+    joinBtn.addEventListener("click", async () => {{
+      /** Сразу при нажатии (до await), иначе мобильный Safari не считает жестом unlock для позднего трека. */
+      stopPrimeSilent();
+      primeAudioElementInGesture();
+      hideTapToPlay();
+      try {{
+        if (roomRef) {{
+          await roomRef.disconnect();
+          roomRef = null;
+        }}
+        const url = document.getElementById("url").value.trim();
+        const room = document.getElementById("room").value;
+        const identity = document.getElementById("identity").value;
+        const tokenResp = await fetch(`/livekit/token?room=${{encodeURIComponent(room)}}&identity=${{encodeURIComponent(identity)}}&role=viewer`, {{ cache: "no-store" }});
+        if (!tokenResp.ok) {{
+          const errBody = await tokenResp.text();
+          throw new Error("токен: HTTP " + tokenResp.status + " " + errBody);
+        }}
+        const tokenJson = await tokenResp.json();
+        if (!tokenJson.token) {{
+          throw new Error(tokenJson.error || "ответ без token");
+        }}
+        const lkRoom = new Room({{
+          disconnectOnPageLeave: false,
+          adaptiveStream: false,
+          dynacast: false,
+          webAudioMix: false,
+        }});
+        roomRef = lkRoom;
+        function attachIfAudio(track) {{
+          if (track && track.kind === "audio") {{
+            preparePlayerForLiveTrack();
+            track.attach(player);
+            status.textContent = "audio subscribed";
+            ensureMediaSessionMetadata();
+            syncMediaSessionPlaying();
+            void unlockPlaybackAfterAttach(lkRoom);
+          }}
+        }}
+        lkRoom.on("trackSubscribed", (track) => attachIfAudio(track));
+        lkRoom.on("disconnected", () => {{
+          stopMediaSessionKeepAlive();
+          stopPrimeSilent();
+          try {{
+            if ("mediaSession" in navigator) navigator.mediaSession.setPositionState(null);
+          }} catch (_) {{}}
+          status.textContent = "disconnected";
+          hideTapToPlay();
+          roomRef = null;
+          try {{
+            player.pause();
+          }} catch (_) {{}}
+          updatePlayChrome();
+        }});
+        await lkRoom.connect(url, tokenJson.token);
+        status.textContent = "connected";
+        updatePlayChrome();
+        // Разблокировка звука в рамках жеста (клик Join): важно для iOS / политик автозапуска
+        try {{
+          await lkRoom.startAudio();
+        }} catch (_) {{}}
+        // Участники уже в комнате: цепляем уже опубликованные аудио (Maps в SDK)
+        lkRoom.remoteParticipants.forEach((participant) => {{
+          participant.audioTrackPublications.forEach((pub) => {{
+            if (pub.track) attachIfAudio(pub.track);
+            pub.on("subscribed", (track) => attachIfAudio(track));
+          }});
+        }});
+        try {{
+          await lkRoom.startAudio();
+        }} catch (_) {{}}
+        startMediaSessionKeepAlive();
+        ensureMediaSessionMetadata();
+        syncMediaSessionPlaying();
+        const scheduleMobilePlaybackRetry = () => {{
+          [400, 1200, 2500].forEach((ms) => {{
+            setTimeout(() => {{
+              try {{
+                if (!roomRef || roomRef !== lkRoom || !player.srcObject) return;
+                if (player.paused) void unlockPlaybackAfterAttach(lkRoom);
+                if (player.paused) showTapToPlay();
+                updatePlayChrome();
+              }} catch (_) {{}}
+            }}, ms);
+          }});
+        }};
+        scheduleMobilePlaybackRetry();
+      }} catch (e) {{
+        try {{
+          if (roomRef) await roomRef.disconnect();
+        }} catch (_) {{}}
+        roomRef = null;
+        stopPrimeSilent();
+        try {{
+          if ("mediaSession" in navigator) navigator.mediaSession.setPositionState(null);
+        }} catch (_) {{}}
+        let msg = (e && e.message) ? e.message : String(e);
+        if (/Failed to fetch|NetworkError|load failed/i.test(msg)) {{
+          msg += "\\n\\nЧастые причины: неверный хост (127.0.0.1 с другого устройства), LiveKit не запущен, порт 7880 закрыт файрволом, или страница по HTTPS а URL начинается с ws:// (нужен wss://).";
+        }}
+        status.textContent = "error: " + msg;
+        updatePlayChrome();
+      }}
+    }});
+
+    updatePlayChrome();
+}})();
   </script>
 </body>
 </html>
 """
     return web.Response(text=page, content_type="text/html")
-
-
-async def listen_route(request: web.Request) -> web.StreamResponse:
-    """HTTP MP3 из комнаты LiveKit для нативного audio src в браузере."""
-    api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
-    api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
-    if not api_key or not api_secret:
-        raise web.HTTPServiceUnavailable(text="На сервере не заданы LIVEKIT_API_KEY / LIVEKIT_API_SECRET.")
-
-    def build_viewer_token(room: str, identity: str) -> str:
-        return build_token(api_key, api_secret, room, identity, False)
-
-    return await handle_listen_mp3(
-        request,
-        livekit_ws_url=livekit_public_ws_url(request),
-        build_viewer_token=build_viewer_token,
-    )
 
 
 async def healthz(_: web.Request) -> web.Response:
@@ -188,7 +609,6 @@ async def livekit_publisher_token(request: web.Request) -> web.Response:
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
-    app.router.add_get("/listen.mp3", listen_route)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/client/discovery", client_discovery)
     app.router.add_get("/livekit/token", livekit_token)
@@ -301,7 +721,6 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
     lines += [
         "",
         f"  Helper слушает:           http://{bind_host}:{bind_port}/",
-        f"  Веб: HTTP MP3 (нативный плеер): {helper_url}/listen.mp3?room={room}  (нужен ffmpeg в PATH на сервере)",
         "  Ошибка 401 при подключении к LiveKit: см. проверку ключей выше (livekit.env ↔ livekit.yaml).",
         "=" * 72,
         "",
