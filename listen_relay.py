@@ -72,8 +72,17 @@ async def _pipe_track_to_mp3(
     proc: asyncio.subprocess.Process | None = None
     stream = rtc.AudioStream.from_track(track=audio_track, sample_rate=48000, num_channels=1)
 
+    async def drain_stderr(p: asyncio.subprocess.Process) -> None:
+        if p.stderr is None:
+            return
+        try:
+            err = await p.stderr.read()
+            if err:
+                logger.warning("ffmpeg stderr: %s", err.decode(errors="replace")[:2000])
+        except Exception:
+            pass
+
     try:
-        # stderr в PIPE при долгом потоке может заполниться и подвесить ffmpeg; лог не критичен
         proc = await asyncio.create_subprocess_exec(
             FFMPEG,
             "-hide_banner",
@@ -96,7 +105,7 @@ async def _pipe_track_to_mp3(
             "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
 
         async def feed_stdin() -> None:
@@ -104,19 +113,16 @@ async def _pipe_track_to_mp3(
             try:
                 async for event in stream:
                     data = event.frame.data
-                    # asyncio (Linux): запись b"" в pipe вызывает assert в _UnixWritePipeTransport
-                    if not data:
-                        continue
-                    proc.stdin.write(data)
-                    await proc.stdin.drain()
+                    if data:
+                        proc.stdin.write(data)
+                        await proc.stdin.drain()
             except Exception as e:
                 logger.debug("feed_stdin: %s", e)
             finally:
                 try:
-                    w = proc.stdin
-                    if w is not None and not w.is_closing():
-                        w.close()
-                        await w.wait_closed()
+                    if proc.stdin and not proc.stdin.is_closing():
+                        proc.stdin.close()
+                        await proc.stdin.wait_closed()
                 except Exception:
                     pass
                 try:
@@ -131,10 +137,7 @@ async def _pipe_track_to_mp3(
                     chunk = await proc.stdout.read(8192)
                     if not chunk:
                         break
-                    try:
-                        await response.write(chunk)
-                    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
-                        break
+                    await response.write(chunk)
                     tr = request.transport
                     if tr is not None and tr.is_closing():
                         break
@@ -142,6 +145,7 @@ async def _pipe_track_to_mp3(
                 pass
 
         feed_task = asyncio.create_task(feed_stdin())
+        err_task = asyncio.create_task(drain_stderr(proc))
         out_task = asyncio.create_task(drain_stdout())
 
         await asyncio.wait(
@@ -155,6 +159,11 @@ async def _pipe_track_to_mp3(
                     await t
                 except asyncio.CancelledError:
                     pass
+        err_task.cancel()
+        try:
+            await err_task
+        except asyncio.CancelledError:
+            pass
 
     finally:
         try:
@@ -227,10 +236,12 @@ async def handle_listen_mp3(
 
     try:
         await _pipe_track_to_mp3(room, audio_track, request, resp)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
+    except Exception as e:
         logger.exception("listen relay pipe failed")
+        try:
+            await resp.write(f"\n".encode())
+        except Exception:
+            pass
     finally:
         try:
             await resp.write_eof()
