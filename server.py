@@ -88,31 +88,14 @@ async def index(request: web.Request) -> web.Response:
       overflow: hidden; clip: rect(0,0,0,0); border: 0;
     }}
     .player-shell {{
-      margin-top: 16px; padding: 14px; border: 3px solid #2563eb; border-radius: 12px;
-      background: #eff6ff; display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
-      box-sizing: border-box;
-    }}
-    @media (max-width: 640px) {{
-      .player-shell {{
-        position: sticky; bottom: 8px; z-index: 50;
-        box-shadow: 0 -6px 18px rgba(37, 99, 235, 0.15);
-      }}
-    }}
-    .player-shell-head {{
-      flex: 1 1 100%; margin: 0 0 4px 0; font-size: 1.15rem; color: #1e3a8a;
-    }}
-    .sdk-err {{
-      flex: 1 1 100%; padding: 10px; background: #fee2e2; border-radius: 8px; color: #991b1b; font-size: 0.9rem;
+      margin-top: 12px; padding: 12px; border: 1px solid #ccc; border-radius: 10px;
+      background: #fafafa; display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
     }}
     .player-shell .btn-main {{
-      flex: 1 1 auto; min-height: 52px; font-size: 1.15rem; font-weight: 700;
-      padding: 14px 18px; margin: 0; width: auto !important;
-      background: #2563eb; color: #fff; border: none; border-radius: 10px;
+      flex: 1 1 auto; min-height: 48px; font-size: 1.1rem; font-weight: 600;
+      padding: 12px 16px; margin: 0; width: auto;
     }}
-    .player-shell .btn-main:disabled {{
-      background: #94a3b8; color: #f1f5f9;
-    }}
-    .player-shell .live-label {{ flex: 1 1 100%; font-size: 0.95rem; color: #334155; line-height: 1.35; }}
+    .player-shell .live-label {{ flex: 1 1 100%; font-size: 0.9rem; color: #333; }}
     #tapToPlay {{ display: none; margin-top: 12px; padding: 12px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; }}
     #tapToPlay.show {{ display: block; }}
     #tapToPlayBtn {{ font-size: 1.05rem; font-weight: 600; }}
@@ -134,12 +117,6 @@ async def index(request: web.Request) -> web.Response:
     <label>Identity</label>
     <input id="identity" value="web-viewer" />
     <button id="join">Join room</button>
-    <div id="playerShell" class="player-shell">
-      <div class="player-shell-head"><strong>Плеер эфира</strong> — большая синяя кнопка ниже (не полоска браузера).</div>
-      <div id="sdkLoadError" class="sdk-err" hidden></div>
-      <button type="button" id="btnPlayPause" class="btn-main" disabled>Слушать</button>
-      <span id="liveLabel" class="live-label">Сначала нажмите «Join room», затем дождитесь эфира.</span>
-    </div>
     <div class="status" id="status">offline</div>
     <div id="tapToPlay" aria-live="polite">
       <button type="button" id="tapToPlayBtn">Включить звук</button>
@@ -147,33 +124,14 @@ async def index(request: web.Request) -> web.Response:
     </div>
     <!-- Отдельный элемент только для «прогрева» жеста — не смешивать с WebRTC (Chrome Android). -->
     <audio id="primeSilent" preload="auto" playsinline style="display:none;width:0;height:0;position:absolute;visibility:hidden" aria-hidden="true"></audio>
+    <div id="playerShell" class="player-shell">
+      <button type="button" id="btnPlayPause" class="btn-main" disabled>Слушать</button>
+      <span id="liveLabel" class="live-label">Нет потока — подключитесь и дождитесь эфира.</span>
+    </div>
     <audio id="player" preload="none" playsinline></audio>
   </div>
   <script type="module">
-(async () => {{
-  let Room;
-  try {{
-    let mod;
-    try {{
-      mod = await import("https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs");
-    }} catch (e1) {{
-      mod = await import("https://unpkg.com/livekit-client@2/dist/livekit-client.esm.mjs");
-    }}
-    Room = mod.Room;
-  }} catch (e) {{
-    const st = document.getElementById("status");
-    const banner = document.getElementById("sdkLoadError");
-    const msg =
-      "Не удалось загрузить LiveKit SDK (пробовали cdn.jsdelivr.net и unpkg.com). Проверьте интернет и блокировщики. Ошибка: "
-      + ((e && e.message) ? e.message : String(e));
-    if (st) st.textContent = msg;
-    if (banner) {{
-      banner.hidden = false;
-      banner.textContent = msg;
-    }}
-    return;
-  }}
-
+    import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
     const joinBtn = document.getElementById("join");
     const status = document.getElementById("status");
     const player = document.getElementById("player");
@@ -183,10 +141,6 @@ async def index(request: web.Request) -> web.Response:
     const playerShell = document.getElementById("playerShell");
     const btnPlayPause = document.getElementById("btnPlayPause");
     const liveLabel = document.getElementById("liveLabel");
-    if (!joinBtn || !player || !btnPlayPause) {{
-      if (status) status.textContent = "Ошибка страницы: обновите с принудительным сбросом кэша (Ctrl+F5).";
-      return;
-    }}
     let roomRef = null;
     let resumeAfterSuspendTimer = null;
     let mediaSessionKeepAlive = null;
@@ -249,10 +203,10 @@ async def index(request: web.Request) -> web.Response:
     }}
 
     function showTapToPlay() {{
-      if (tapToPlayEl) tapToPlayEl.classList.add("show");
+      tapToPlayEl.classList.add("show");
     }}
     function hideTapToPlay() {{
-      if (tapToPlayEl) tapToPlayEl.classList.remove("show");
+      tapToPlayEl.classList.remove("show");
     }}
 
     /**
@@ -323,7 +277,7 @@ async def index(request: web.Request) -> web.Response:
       updatePlayChrome();
     }});
 
-    if (tapToPlayBtn) tapToPlayBtn.addEventListener("click", async () => {{
+    tapToPlayBtn.addEventListener("click", async () => {{
       try {{
         if (roomRef) await roomRef.startAudio();
       }} catch (_) {{}}
@@ -563,7 +517,6 @@ async def index(request: web.Request) -> web.Response:
     }});
 
     updatePlayChrome();
-}})();
   </script>
 </body>
 </html>
