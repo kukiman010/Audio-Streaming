@@ -8,10 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import queue
 import shutil
-import subprocess
-import threading
 import uuid
 from typing import Callable
 
@@ -66,106 +63,72 @@ async def _wait_first_audio_track(room: rtc.Room, timeout: float) -> rtc.Track:
     return first[0]
 
 
-async def _pcm_shutdown_sentinel(pcm_q: queue.Queue) -> None:
-    """Закрыть очередь PCM — даже если переполнена (blocking put в потоке)."""
-    try:
-        pcm_q.put_nowait(None)
-    except queue.Full:
-        await asyncio.to_thread(pcm_q.put, None)
-
-
-def _stdin_writer_thread(proc: subprocess.Popen, pcm_q: queue.Queue) -> None:
-    """
-    Пишет PCM в ffmpeg через обычный blocking PIPE — не asyncio.StreamWriter
-    (обходит assert «Data should not be empty» в Python 3.10 asyncio Unix pipe).
-    """
-    assert proc.stdin is not None
-    try:
-        while True:
-            item = pcm_q.get()
-            if item is None:
-                break
-            if item:
-                proc.stdin.write(item)
-    except BrokenPipeError:
-        pass
-    except Exception as e:
-        logger.debug("stdin_writer: %s", e)
-    finally:
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-
-
 async def _pipe_track_to_mp3(
     room: rtc.Room,
     audio_track: rtc.Track,
     request: web.Request,
     response: web.StreamResponse,
 ) -> None:
-    proc: subprocess.Popen | None = None
-    writer_thread: threading.Thread | None = None
+    proc: asyncio.subprocess.Process | None = None
     stream = rtc.AudioStream.from_track(track=audio_track, sample_rate=48000, num_channels=1)
-    pcm_q: queue.Queue = queue.Queue(maxsize=512)
 
     try:
-        proc = subprocess.Popen(
-            [
-                FFMPEG,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "s16le",
-                "-ar",
-                "48000",
-                "-ac",
-                "1",
-                "-i",
-                "pipe:0",
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                "96k",
-                "-f",
-                "mp3",
-                "pipe:1",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+        # stderr в PIPE при долгом потоке может заполниться и подвесить ffmpeg; лог не критичен
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "96k",
+            "-f",
+            "mp3",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        assert proc.stdin is not None and proc.stdout is not None
 
-        wt = threading.Thread(
-            target=_stdin_writer_thread,
-            args=(proc, pcm_q),
-            name="ffmpeg-stdin",
-            daemon=True,
-        )
-        writer_thread = wt
-        wt.start()
-
-        async def feed_livekit() -> None:
+        async def feed_stdin() -> None:
+            assert proc is not None and proc.stdin is not None
             try:
                 async for event in stream:
                     data = event.frame.data
+                    # asyncio (Linux): запись b"" в pipe вызывает assert в _UnixWritePipeTransport
                     if not data:
                         continue
-                    await asyncio.to_thread(pcm_q.put, data)
+                    proc.stdin.write(data)
+                    await proc.stdin.drain()
             except Exception as e:
-                logger.debug("feed_livekit: %s", e)
+                logger.debug("feed_stdin: %s", e)
             finally:
+                try:
+                    w = proc.stdin
+                    if w is not None and not w.is_closing():
+                        w.close()
+                        await w.wait_closed()
+                except Exception:
+                    pass
                 try:
                     await stream.aclose()
                 except Exception:
                     pass
 
-        async def drain_http() -> None:
+        async def drain_stdout() -> None:
+            assert proc is not None and proc.stdout is not None
             try:
                 while True:
-                    chunk = await asyncio.to_thread(proc.stdout.read, 65536)
+                    chunk = await proc.stdout.read(8192)
                     if not chunk:
                         break
                     try:
@@ -178,11 +141,11 @@ async def _pipe_track_to_mp3(
             except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
                 pass
 
-        feed_task = asyncio.create_task(feed_livekit())
-        out_task = asyncio.create_task(drain_http())
+        feed_task = asyncio.create_task(feed_stdin())
+        out_task = asyncio.create_task(drain_stdout())
 
         await asyncio.wait(
-            {feed_task, out_task},
+            [feed_task, out_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
         for t in (feed_task, out_task):
@@ -193,28 +156,20 @@ async def _pipe_track_to_mp3(
                 except asyncio.CancelledError:
                     pass
 
-        await _pcm_shutdown_sentinel(pcm_q)
-        if writer_thread is not None:
-            await asyncio.to_thread(writer_thread.join, 5.0)
-
     finally:
         try:
             await room.disconnect()
         except Exception:
             pass
-        await _pcm_shutdown_sentinel(pcm_q)
-        if writer_thread is not None and writer_thread.is_alive():
-            await asyncio.to_thread(writer_thread.join, 3.0)
-        if proc is not None:
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.to_thread(proc.wait)
-                except Exception:
-                    pass
+        if proc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
 
 
 async def handle_listen_mp3(
