@@ -27,6 +27,15 @@ share/python-wheels/
 MANIFEST
 .vscode/
 
+# Android / Gradle
+android/.gradle/
+android/.idea/
+android/local.properties
+android/**/build/
+android/**/.cxx/
+android/**/*.iml
+android/.vendor/
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.

@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">Audio Stream Listener</string>
+    <string name="server_ip">Server IP</string>
+    <string name="helper_port">Helper port</string>
+    <string name="livekit_port">LiveKit port</string>
+    <string name="ports_settings">Port settings</string>
+    <string name="scan_qr">Scan QR code</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="connecting">Connecting…</string>
+    <string name="status_offline">offline</string>
+    <string name="app_version_label">v%1$s — %2$s</string>
+    <string name="qr_scan_hint">Point the camera at the QR code on the publisher screen</string>
+    <string name="qr_invalid">QR does not contain a valid helper URL</string>
+    <string name="camera_permission_required">Camera permission is required to scan QR codes</string>
+    <string name="invalid_ip">Enter server IP or hostname</string>
+    <string name="invalid_port">Port must be between 1 and 65535</string>
+    <string name="notification_channel_name">Audio playback</string>
+    <string name="notification_channel_description">Keeps the LiveKit audio stream active in background.</string>
+    <string name="notification_title">Audio stream active</string>
+    <string name="notification_connecting">Connecting to stream…</string>
+    <string name="notification_connected">Listening to %1$s</string>
+    <string name="notification_disconnected">Disconnected</string>
+    <string name="notification_paused">Playback paused</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_play">Play</string>
+</resources>
