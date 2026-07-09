@@ -1,7 +1,9 @@
 # LiveKit / WebRTC
 -keep class io.livekit.** { *; }
 -keep class org.webrtc.** { *; }
+-keep class livekit.org.webrtc.** { *; }
 -dontwarn org.webrtc.**
+-dontwarn livekit.org.webrtc.**
 
 # AudioSwitch (davidliu fork required by LiveKit)
 -keep class com.twilio.audioswitch.** { *; }

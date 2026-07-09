@@ -3,7 +3,6 @@
     <color name="launcher_foreground">#4FC3F7</color>
     <color name="waveform_accent">#4FC3F7</color>
     <color name="waveform_baseline">#66FFFFFF</color>
-    <color name="waveform_bar_dim">#994FC3F7</color>
-    <color name="waveform_background">#1AFFFFFF</color>
+    <color name="waveform_background">#121C2B</color>
     <color name="status_text">#B3FFFFFF</color>
 </resources>

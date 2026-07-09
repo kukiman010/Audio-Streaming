@@ -10,7 +10,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
@@ -30,25 +29,63 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import livekit.org.webrtc.AudioTrackSink
+import java.nio.ByteBuffer
 import java.util.concurrent.CancellationException as JavaCancellationException
+import kotlin.math.abs
 
 class PlaybackService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var room: Room? = null
     private var eventsJob: Job? = null
     private var connectJob: Job? = null
-    private var levelPollJob: Job? = null
     private var currentRoomName: String = ""
     private var activeConnectKey: String? = null
     private var isPaused = false
     private var isSessionConnected = false
-    private var lastLevelBroadcastAt = 0L
     private val audioTracks = mutableListOf<AudioTrack>()
     private lateinit var mediaSession: MediaSessionCompat
+    private val waveformScratch = FloatArray(WAVEFORM_SCRATCH_SIZE)
+    private val waveformSink = object : AudioTrackSink {
+        override fun onData(
+            audioData: ByteBuffer?,
+            bitsPerSample: Int,
+            sampleRate: Int,
+            numberOfChannels: Int,
+            numberOfFrames: Int,
+            absoluteCaptureTimestampMs: Long,
+        ) {
+            if (isPaused || audioData == null || bitsPerSample != 16 || numberOfChannels <= 0 || numberOfFrames <= 0) {
+                return
+            }
+
+            val step = maxOf(1, numberOfFrames / WAVEFORM_POINTS_PER_CALLBACK)
+            var scratchIndex = 0
+            var frame = 0
+            while (frame < numberOfFrames && audioData.remaining() >= 2 * numberOfChannels) {
+                var peak = 0f
+                repeat(numberOfChannels) {
+                    val sample = audioData.getShort().toFloat() / 32768f
+                    if (abs(sample) > abs(peak)) {
+                        peak = sample
+                    }
+                }
+                if (frame % step == 0) {
+                    waveformScratch[scratchIndex++] = peak
+                    if (scratchIndex >= waveformScratch.size) {
+                        WaveformSampleBuffer.write(waveformScratch, scratchIndex)
+                        scratchIndex = 0
+                    }
+                }
+                frame++
+            }
+            if (scratchIndex > 0) {
+                WaveformSampleBuffer.write(waveformScratch, scratchIndex)
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -150,6 +187,7 @@ class PlaybackService : Service() {
                                             audioTracks.add(track)
                                         }
                                     }
+                                    track.addSink(waveformSink)
                                     track.enabled = !isPaused
                                     broadcastStatus(STATUS_AUDIO, "audio subscribed")
                                     updateNotification(
@@ -161,16 +199,10 @@ class PlaybackService : Service() {
                             is RoomEvent.TrackUnsubscribed -> {
                                 val track = event.track
                                 if (track is AudioTrack) {
+                                    track.removeSink(waveformSink)
                                     synchronized(audioTracks) {
                                         audioTracks.remove(track)
                                     }
-                                }
-                            }
-
-                            is RoomEvent.ActiveSpeakersChanged -> {
-                                if (!isPaused) {
-                                    val level = event.speakers.maxOfOrNull { it.audioLevel } ?: 0f
-                                    broadcastLevel(level)
                                 }
                             }
 
@@ -185,7 +217,6 @@ class PlaybackService : Service() {
                     }
                 }
 
-                startLevelPolling()
                 broadcastStatus(STATUS_CONNECTED, "connected")
                 updateNotification(getString(R.string.notification_connected, currentRoomName))
                 updatePlaybackState()
@@ -210,29 +241,13 @@ class PlaybackService : Service() {
         }
     }
 
-    private fun startLevelPolling() {
-        levelPollJob?.cancel()
-        levelPollJob = serviceScope.launch {
-            while (isActive && isSessionConnected) {
-                delay(LEVEL_POLL_MS)
-                if (isPaused) {
-                    broadcastLevel(0f)
-                    continue
-                }
-                val activeRoom = room ?: continue
-                val level = activeRoom.remoteParticipants.values.maxOfOrNull { it.audioLevel } ?: 0f
-                broadcastLevel(level)
-            }
-        }
-    }
-
     private fun pausePlayback() {
         if (!isSessionConnected || isPaused) {
             return
         }
         isPaused = true
         setAudioTracksEnabled(false)
-        broadcastLevel(0f)
+        WaveformSampleBuffer.clear()
         broadcastStatus(STATUS_PAUSED, getString(R.string.notification_paused))
         updateNotification(getString(R.string.notification_paused))
         updatePlaybackState()
@@ -258,13 +273,15 @@ class PlaybackService : Service() {
     }
 
     private fun cleanupPreviousSession() {
-        levelPollJob?.cancel()
-        levelPollJob = null
         eventsJob?.cancel()
         eventsJob = null
         synchronized(audioTracks) {
+            audioTracks.forEach { track ->
+                track.removeSink(waveformSink)
+            }
             audioTracks.clear()
         }
+        WaveformSampleBuffer.clear()
         isSessionConnected = false
         isPaused = false
 
@@ -285,7 +302,6 @@ class PlaybackService : Service() {
         connectJob?.cancel()
         connectJob = null
         cleanupPreviousSession()
-        broadcastLevel(0f)
 
         if (stopService) {
             broadcastStatus(STATUS_DISCONNECTED, "disconnected")
@@ -327,19 +343,6 @@ class PlaybackService : Service() {
             setPackage(packageName)
             putExtra(EXTRA_STATUS, status)
             putExtra(EXTRA_STATUS_MESSAGE, message)
-        }
-        sendBroadcast(intent)
-    }
-
-    private fun broadcastLevel(level: Float) {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastLevelBroadcastAt < LEVEL_BROADCAST_MS) {
-            return
-        }
-        lastLevelBroadcastAt = now
-        val intent = Intent(ACTION_LEVEL_CHANGED).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_AUDIO_LEVEL, level.coerceIn(0f, 1f))
         }
         sendBroadcast(intent)
     }
@@ -467,8 +470,8 @@ class PlaybackService : Service() {
 
     companion object {
         private const val TAG = "PlaybackService"
-        private const val LEVEL_BROADCAST_MS = 50L
-        private const val LEVEL_POLL_MS = 80L
+        private const val WAVEFORM_POINTS_PER_CALLBACK = 24
+        private const val WAVEFORM_SCRATCH_SIZE = 64
         private const val REQUEST_PAUSE = 11
         private const val REQUEST_RESUME = 12
 
@@ -477,7 +480,6 @@ class PlaybackService : Service() {
         const val ACTION_PAUSE = "com.audiostreaming.listener.action.PAUSE"
         const val ACTION_RESUME = "com.audiostreaming.listener.action.RESUME"
         const val ACTION_STATUS_CHANGED = "com.audiostreaming.listener.action.STATUS_CHANGED"
-        const val ACTION_LEVEL_CHANGED = "com.audiostreaming.listener.action.LEVEL_CHANGED"
 
         const val EXTRA_HELPER_URL = "extra_helper_url"
         const val EXTRA_LIVEKIT_URL = "extra_livekit_url"
@@ -485,7 +487,6 @@ class PlaybackService : Service() {
         const val EXTRA_IDENTITY = "extra_identity"
         const val EXTRA_STATUS = "extra_status"
         const val EXTRA_STATUS_MESSAGE = "extra_status_message"
-        const val EXTRA_AUDIO_LEVEL = "extra_audio_level"
 
         const val STATUS_CONNECTING = "connecting"
         const val STATUS_CONNECTED = "connected"

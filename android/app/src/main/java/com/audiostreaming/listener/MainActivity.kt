@@ -65,20 +65,12 @@ class MainActivity : AppCompatActivity() {
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                PlaybackService.ACTION_STATUS_CHANGED -> {
-                    val status = intent.getStringExtra(PlaybackService.EXTRA_STATUS).orEmpty()
-                    val message = intent.getStringExtra(PlaybackService.EXTRA_STATUS_MESSAGE).orEmpty()
-                    updateUiForStatus(status, message)
-                }
-
-                PlaybackService.ACTION_LEVEL_CHANGED -> {
-                    if (!isPaused && isConnected) {
-                        val level = intent.getFloatExtra(PlaybackService.EXTRA_AUDIO_LEVEL, 0f)
-                        binding.waveformView.pushLevel(level)
-                    }
-                }
+            if (intent?.action != PlaybackService.ACTION_STATUS_CHANGED) {
+                return
             }
+            val status = intent.getStringExtra(PlaybackService.EXTRA_STATUS).orEmpty()
+            val message = intent.getStringExtra(PlaybackService.EXTRA_STATUS_MESSAGE).orEmpty()
+            updateUiForStatus(status, message)
         }
     }
 
@@ -105,10 +97,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        val filter = IntentFilter().apply {
-            addAction(PlaybackService.ACTION_STATUS_CHANGED)
-            addAction(PlaybackService.ACTION_LEVEL_CHANGED)
-        }
+        val filter = IntentFilter(PlaybackService.ACTION_STATUS_CHANGED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
@@ -255,18 +244,21 @@ class MainActivity : AppCompatActivity() {
                 setInputsEnabled(false)
                 setStatus(message)
                 updateActionButton()
+                binding.waveformView.start()
             }
 
             PlaybackService.STATUS_PAUSED -> {
                 isPaused = true
                 setStatus(message)
                 updateActionButton()
+                binding.waveformView.stop()
             }
 
             PlaybackService.STATUS_PLAYING -> {
                 isPaused = false
                 setStatus(message)
                 updateActionButton()
+                binding.waveformView.start()
             }
 
             PlaybackService.STATUS_DISCONNECTED -> {
