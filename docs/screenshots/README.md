@@ -35,12 +35,17 @@
 - Разумное разрешение (до ~1920 px по ширине)
 - Без персональных данных и реальных секретов на скриншотах
 
-## Вставка в README
+## Добавленные скриншоты
 
-После добавления файлов можно вставить в README:
+| Файл | Описание |
+|------|----------|
+| `client/main-window.png` | Desktop publisher (`gui_client.py`) — подключение, выбор источника, QR для слушателя |
+| `android/main-screen.png` | Android listener — подключение, waveform, воспроизведение |
 
-```markdown
-![Desktop client](docs/screenshots/client/main-window.png)
-![Web viewer](docs/screenshots/web-viewer/viewer-main.png)
-![Android app](docs/screenshots/android/main-screen.png)
-```
+Оба используются в корневом [README.md](../../README.md).
+
+## Ещё не добавлены
+
+| Папка | Что снимать |
+|-------|-------------|
+| `web-viewer/` | Браузерный viewer — страница `/` на helper-сервере |

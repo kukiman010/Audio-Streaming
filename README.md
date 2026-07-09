@@ -6,6 +6,16 @@
 
 Аудиостриминг в реальном времени: десктопный publisher публикует звук в LiveKit, слушатели подключаются через браузер или Android-приложение. Helper-сервис выдаёт JWT-токены и отдаёт встроенный web-viewer.
 
+## Скриншоты
+
+**Desktop publisher** — `gui_client.py` (Windows / Linux):
+
+![Desktop publisher](docs/screenshots/client/main-window.png)
+
+**Android listener** — мобильное приложение:
+
+![Android listener](docs/screenshots/android/main-screen.png)
+
 ## Компоненты
 
 | Компонент | Файл / путь | Назначение |
@@ -165,16 +175,6 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 | `HELPER_HOST` / `HELPER_PORT` | Bind-адрес helper при запуске |
 
 Полный справочник: [docs/configuration.md](docs/configuration.md)
-
-## Скриншоты
-
-Скриншоты интерфейсов добавляются в [docs/screenshots/](docs/screenshots/):
-
-| Папка | Содержание |
-|-------|------------|
-| `docs/screenshots/client/` | Desktop publisher (`gui_client.py`) |
-| `docs/screenshots/web-viewer/` | Браузерный viewer (`/`) |
-| `docs/screenshots/android/` | Мобильное приложение |
 
 ## Советы по задержке и качеству
 

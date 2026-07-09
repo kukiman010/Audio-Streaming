@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import asyncio
+import queue
+import sys
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -63,7 +66,7 @@ class LiveKitStreamClient:
         self._sc_thread: Optional[threading.Thread] = None
         self._sc_pump_task: Optional[asyncio.Task] = None
         self._sc_source: Optional[rtc.AudioSource] = None
-        self._sc_queue: Optional[asyncio.Queue] = None
+        self._sc_sync_queue: Optional[queue.Queue] = None
         self._pump_enabled: Optional[asyncio.Event] = None
         self._user_stop = False
         self._token_provider: Optional[TokenProvider] = None
@@ -89,12 +92,13 @@ class LiveKitStreamClient:
             self._pump_enabled.set()
 
     def _drain_sc_queue(self) -> None:
-        if self._sc_queue is None:
+        q = self._sc_sync_queue
+        if q is None:
             return
-        while not self._sc_queue.empty():
+        while True:
             try:
-                self._sc_queue.get_nowait()
-            except asyncio.QueueEmpty:
+                q.get_nowait()
+            except queue.Empty:
                 break
 
     def _register_room_handlers(self, room: rtc.Room) -> None:
@@ -250,51 +254,57 @@ class LiveKitStreamClient:
 
             source = rtc.AudioSource(int(sample_rate), 1, loop=loop)
             self._sc_source = source
-            self._sc_queue = asyncio.Queue(maxsize=200)
+            sync_q: queue.Queue = queue.Queue(maxsize=200)
+            self._sc_sync_queue = sync_q
             frame_samples = max(1, int(sample_rate) // 100)
-            block_frames = frame_samples * 10
 
             def _loopback_worker() -> None:
                 import soundcard as sc  # type: ignore[import-untyped]
+                from soundcard import SoundcardRuntimeWarning  # type: ignore[import-untyped]
                 from win_com import ensure_com_initialized
 
                 try:
+                    if sys.platform == "win32":
+                        import ctypes
+
+                        # Меньше пропусков буфера WASAPI при нагрузке на CPU/GIL.
+                        ctypes.windll.kernel32.SetThreadPriority(
+                            ctypes.windll.kernel32.GetCurrentThread(), 1
+                        )
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="data discontinuity in recording",
+                        category=SoundcardRuntimeWarning,
+                    )
                     ensure_com_initialized()
                     all_m = sc.all_microphones(include_loopback=True)
                     sc_mic = all_m[lb_index]
                     ch = min(int(sc_mic.channels), 2)
-                    with sc_mic.recorder(int(sample_rate), channels=ch) as rec:
+                    with sc_mic.recorder(
+                        int(sample_rate), channels=ch, blocksize=frame_samples
+                    ) as rec:
                         while self._stop_event and not self._stop_event.is_set():
-                            data = rec.record(block_frames)
-                            n_slice = block_frames // frame_samples
-                            for i in range(n_slice):
-                                seg = data[i * frame_samples : (i + 1) * frame_samples]
-                                if seg.shape[0] < frame_samples:
-                                    break
-                                if seg.ndim == 2 and seg.shape[1] >= 2:
-                                    mono = np.mean(seg[:, :2], axis=1, dtype=np.float64)
-                                elif seg.ndim == 2:
-                                    mono = seg[:, 0].astype(np.float64)
+                            data = rec.record(frame_samples)
+                            if data.shape[0] < frame_samples:
+                                continue
+                            if data.ndim == 2:
+                                if data.shape[1] >= 2:
+                                    mono = (data[:, 0] + data[:, 1]) * 0.5
                                 else:
-                                    mono = seg.astype(np.float64)
-                                pcm = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
-                                frame = rtc.AudioFrame(
-                                    pcm.tobytes(),
-                                    int(sample_rate),
-                                    1,
-                                    frame_samples,
-                                )
-
-                                def _enqueue(fr: rtc.AudioFrame) -> None:
-                                    q = self._sc_queue
-                                    if q is None:
-                                        return
-                                    try:
-                                        q.put_nowait(fr)
-                                    except asyncio.QueueFull:
-                                        pass
-
-                                loop.call_soon_threadsafe(_enqueue, frame)
+                                    mono = data[:, 0]
+                            else:
+                                mono = data
+                            pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype(np.int16)
+                            frame = rtc.AudioFrame(
+                                pcm.tobytes(),
+                                int(sample_rate),
+                                1,
+                                frame_samples,
+                            )
+                            try:
+                                sync_q.put_nowait(frame)
+                            except queue.Full:
+                                pass
                 except Exception as e:
 
                     def _fail() -> None:
@@ -329,20 +339,28 @@ class LiveKitStreamClient:
 
     async def _pump_soundcard(self) -> None:
         assert self._sc_source is not None
+        sync_q = self._sc_sync_queue
         try:
             while self._stop_event and not self._stop_event.is_set():
                 if self._pump_enabled is not None and not self._pump_enabled.is_set():
                     self._drain_sc_queue()
                     await asyncio.sleep(0.05)
                     continue
-                try:
-                    assert self._sc_queue is not None
-                    frame = await asyncio.wait_for(self._sc_queue.get(), timeout=0.3)
-                except asyncio.TimeoutError:
+                if sync_q is None:
+                    await asyncio.sleep(0.05)
                     continue
-                if self._pump_enabled is not None and not self._pump_enabled.is_set():
-                    continue
-                await self._sc_source.capture_frame(frame)
+                drained = False
+                for _ in range(32):
+                    try:
+                        frame = sync_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    drained = True
+                    if self._pump_enabled is not None and not self._pump_enabled.is_set():
+                        continue
+                    await self._sc_source.capture_frame(frame)
+                if not drained:
+                    await asyncio.sleep(0.005)
         except asyncio.CancelledError:
             pass
 
@@ -401,7 +419,7 @@ class LiveKitStreamClient:
             if th.is_alive():
                 th.join(timeout=5.0)
 
-        self._sc_queue = None
+        self._sc_sync_queue = None
 
         if self._sc_source is not None:
             try:
