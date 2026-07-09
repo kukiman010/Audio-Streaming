@@ -1,96 +1,193 @@
-# Audio Streaming (LiveKit) — Debian 12 + Windows/Linux client
+# Audio Streaming (LiveKit)
 
-Компоненты:
-- `gui_client.py` — Tkinter-клиент с нативным publish в LiveKit (без ffmpeg-транспорта).
-- `server.py` — helper service: web-viewer + endpoint для выдачи LiveKit токенов.
-- `deploy/livekit/` — self-host инфраструктура LiveKit (Docker Compose + примеры конфигов).
-- `audio_devices.py` — кроссплатформенное перечисление input-устройств (Linux/Windows).
+**EN:** Self-hosted low-latency audio streaming over [LiveKit](https://livekit.io/). Stack: Python helper + Tkinter publisher, Docker (LiveKit / Redis / coturn), Kotlin Android listener. Quick start: [Server](#развёртывание-сервера) · [Desktop client](#десктоп-клиент-publisher) · [APK build](#сборка-android-apk).
 
-## Установка (Debian 12)
+---
 
-1) Системные пакеты:
-sudo apt update
-sudo apt install -y python3-venv python3-pip ffmpeg portaudio19-dev
+Аудиостриминг в реальном времени: десктопный publisher публикует звук в LiveKit, слушатели подключаются через браузер или Android-приложение. Helper-сервис выдаёт JWT-токены и отдаёт встроенный web-viewer.
 
-2) Сервер:
-cd audio-streaming/server
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-# Запуск разработки:
-uvicorn server.app:app --host 0.0.0.0 --port 8000 --proxy-headers
+## Компоненты
 
-# Продакшн через systemd:
-# Скопируйте проект в /opt/audio-streaming, отредактируйте юнит (путь/пользователь), затем:
-sudo cp ../systemd/audio-stream-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now audio-stream-server.service
+| Компонент | Файл / путь | Назначение |
+|-----------|-------------|------------|
+| Helper + web-viewer | `server.py` | Выдача токенов, discovery, страница прослушивания в браузере |
+| Desktop publisher | `gui_client.py` | Захват микрофона / loopback, публикация в LiveKit |
+| Инфраструктура | `deploy/livekit/` | LiveKit SFU, Redis, coturn (Docker Compose) |
+| Android listener | `android/app/` | Подписка на аудио, QR-подключение, фоновое воспроизведение |
+| Настройка | `setup_livekit.py` | Генерация секретов и первичная конфигурация |
 
-# (Опционально) Nginx фронт + HTTPS (Let's Encrypt):
-# Проверьте nginx/audio-stream.conf и установите certbot.
+Подробнее: [docs/architecture.md](docs/architecture.md)
 
-Переменные окружения сервера:
-- STREAM_DOMAIN: если задан, ссылки строятся через этот домен (например, kukiman.ru).
-- STREAM_SCHEME: http/https; если не задан — берется из запроса.
-- PREROLL_MAX_BYTES: размер буфера преролла (по умолчанию 262144).
-- HEADER_WAIT_TIMEOUT: таймаут ожидания заголовков для слушателя (по умолчанию 5.0).
-- ACTIVE_THRESHOLD_SEC: окно, в котором поступали данные, чтобы считать “в эфире” (по умолчанию 2.5 сек).
+## Технический стек
 
-3) Клиент-стример:
-cd ../client_streamer
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python3 streamer.py
+| Слой | Технологии |
+|------|------------|
+| **Python** | 3.9+, aiohttp, livekit / livekit-api, sounddevice, soundcard (Windows loopback), Tkinter |
+| **Инфраструктура** | Docker Compose, LiveKit Server, Redis 7, coturn 4.6 |
+| **Android** | Kotlin, Gradle 8.7, AGP 8.5, LiveKit Android 2.26, CameraX, ML Kit (QR), Twilio AudioSwitch |
 
-В окне задайте адрес сервера (например, http://127.0.0.1:8000), выберите входное устройство и нажмите “Начать стрим”.
+## Требования
 
-## Быстрый старт (миграция на LiveKit)
+- **Сервер:** Python 3.9+, Docker и Docker Compose
+- **Desktop publisher:** те же Python-зависимости; на Linux — `portaudio19-dev`, `ffmpeg` (опционально для legacy-транспорта)
+- **Сборка APK:** Docker Desktop **или** локальный Android SDK (API 36, JDK 17)
 
-1) Установите зависимости:
+## Быстрый старт
+
 ```bash
+# 1. Зависимости Python
 python -m pip install -r requirements.txt
+
+# 2. Первичная настройка (генерирует секреты, создаёт конфиги)
+python setup_livekit.py
+
+# 3. LiveKit (Docker) + helper-сервер
+./start_server.sh
+
+# 4. Publisher на той же или другой машине
+python gui_client.py
 ```
 
-2) Подготовьте env и конфиги:
-```bash
-cp livekit.env.example livekit.env
-cp deploy/livekit/livekit.yaml.example deploy/livekit/livekit.yaml
-cp deploy/livekit/turnserver.conf.example deploy/livekit/turnserver.conf
-```
-Заполните секреты и домен.
+На Windows для шага 3 см. [развёртывание сервера](#развёртывание-сервера).
 
-Упрощенный вариант (автогенерация секретов + интерактивные вопросы):
-```bash
-python3 setup_livekit.py
-```
+## Развёртывание сервера
 
-3) Запустите LiveKit + helper web одной командой:
+### Linux / macOS / WSL
+
 ```bash
 ./start_server.sh
 ```
 
-4) Запустите клиент:
+Скрипт создаёт `.venv`, при первом запуске вызывает `setup_livekit.py`, поднимает Docker Compose и запускает `server.py` на `HELPER_HOST:HELPER_PORT` (по умолчанию `0.0.0.0:8000`).
+
+Ручная настройка конфигов (без `setup_livekit.py`):
+
+```bash
+cp livekit.env.example livekit.env
+cp deploy/livekit/livekit.yaml.example deploy/livekit/livekit.yaml
+cp deploy/livekit/turnserver.conf.example deploy/livekit/turnserver.conf
+# Заполните секреты и публичные URL, затем:
+docker compose -f deploy/livekit/docker-compose.yml up -d
+python server.py --host 0.0.0.0 --port 8000
+```
+
+### Windows (без bash)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python setup_livekit.py
+docker compose -f deploy/livekit/docker-compose.yml up -d
+docker compose -f deploy/livekit/docker-compose.yml restart livekit
+python server.py --host 0.0.0.0 --port 8000
+```
+
+### Порты (открыть в firewall)
+
+| Порт | Протокол | Сервис |
+|------|----------|--------|
+| 8000 | TCP | Helper (`server.py`) |
+| 7880 | TCP | LiveKit signaling (WebSocket) |
+| 7881 | TCP | LiveKit RTC TCP |
+| 50000–50100 | UDP | LiveKit media |
+| 3478, 5349 | UDP/TCP | coturn (TURN) |
+
+Для удалённых клиентов в `livekit.env` задайте публичный IP или домен:
+
+```env
+LIVEKIT_URL=ws://YOUR_HOST:7880
+HELPER_URL=http://YOUR_HOST:8000
+```
+
+Подробная конфигурация: [docs/configuration.md](docs/configuration.md)
+
+## Десктоп-клиент (publisher)
+
 ```bash
 python gui_client.py
 ```
 
-5) Проверка smoke/perf:
-```bash
-python performance_validation.py
+1. Укажите адрес helper-сервера (IP или `http://host:8000`).
+2. Выберите входное устройство (микрофон, loopback на Windows).
+3. Нажмите «Начать стрим».
+
+Клиент автоматически читает `livekit.env` / `.env`. Publisher-токен запрашивается у helper по `LIVEKIT_PAIRING_SECRET` — секрет LiveKit API в GUI вводить не нужно.
+
+## Сборка Android APK
+
+### Docker (без локального Android SDK)
+
+```powershell
+# Windows
+cd android
+.\build_docker.bat -Variant release
 ```
+
+```bash
+# Linux / macOS
+cd android
+./build_docker.sh --variant release
+```
+
+APK: `android/app/build/outputs/apk/release/app-release.apk`
+
+### Локальный Gradle (если установлен SDK)
+
+```bash
+cd android
+./gradlew assembleRelease
+```
+
+### Установка на устройство
+
+```bash
+adb install -r android/app/build/outputs/apk/release/app-release.apk
+```
+
+## Android listener
+
+1. Установите APK на устройство (arm64-v8a).
+2. Введите IP сервера или отсканируйте QR с URL helper (`http://host:port`).
+3. Приложение запрашивает `/client/discovery`, получает токен и подключается к LiveKit.
+4. Воспроизведение продолжается в фоне через foreground service.
+
+## Конфигурация
+
+Основной файл — `livekit.env` (шаблон: [livekit.env.example](livekit.env.example)):
+
+| Переменная | Описание |
+|------------|----------|
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Ключи LiveKit (должны совпадать с `keys:` в `livekit.yaml`) |
+| `LIVEKIT_PAIRING_SECRET` | Секрет для выдачи publisher-токена GUI-клиенту |
+| `LIVEKIT_URL` | WebSocket URL LiveKit для клиентов |
+| `HELPER_URL` | Публичный URL helper-сервера |
+| `HELPER_HOST` / `HELPER_PORT` | Bind-адрес helper при запуске |
+
+Полный справочник: [docs/configuration.md](docs/configuration.md)
+
+## Скриншоты
+
+Скриншоты интерфейсов добавляются в [docs/screenshots/](docs/screenshots/):
+
+| Папка | Содержание |
+|-------|------------|
+| `docs/screenshots/client/` | Desktop publisher (`gui_client.py`) |
+| `docs/screenshots/web-viewer/` | Браузерный viewer (`/`) |
+| `docs/screenshots/android/` | Мобильное приложение |
 
 ## Советы по задержке и качеству
 
 - Используйте UDP и рабочий TURN (coturn) для клиентов за NAT.
-- Начинайте с `48000 Hz`, `1-2` канала; увеличивайте только при необходимости.
-- Для production задавайте длинные секреты (`LIVEKIT_API_SECRET` 32+ байт).
-- `gui_client.py` и `server.py` автоматически читают `livekit.env` и `.env`.
-- Клиент получает publisher token от helper-сервера по `LIVEKIT_PAIRING_SECRET`, поэтому `LIVEKIT_API_SECRET` не нужно вручную вводить в GUI.
+- Начинайте с 48 kHz, 1–2 канала.
+- Для production задавайте длинные секреты (`LIVEKIT_API_SECRET` — 32+ байт).
+- После смены ключей в `livekit.yaml` перезапустите контейнер LiveKit: `docker compose -f deploy/livekit/docker-compose.yml restart livekit`.
+- Синхронизируйте время (NTP) на сервере и клиентах — JWT зависит от `exp` / `nbf`.
 
-## Локальное тестирование
+## Проверка
 
-- Запустите `server.py`.
-- В браузере откройте `/` и подключитесь к room через встроенный LiveKit viewer.
-- Запустите `gui_client.py` и публикуйте аудио в ту же комнату.
+```bash
+python performance_validation.py
+```
 
+Smoke-тест helper-сервиса (`/healthz`, `/livekit/token`). Внешний LiveKit SFU для теста не требуется.

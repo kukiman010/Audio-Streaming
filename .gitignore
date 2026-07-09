@@ -78,8 +78,6 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
 conf/
 users_media/*
 cloudapi/
