@@ -37,10 +37,9 @@ class LiveKitState:
 
 def _validate_sc_loopback_index(index: int) -> None:
     """Проверка индекса sc_lb:N до старта потока; COM и объекты soundcard — в своём потоке."""
-    import soundcard as sc  # type: ignore[import-untyped]
-    from win_com import ensure_com_initialized
+    from win_com import import_soundcard
 
-    ensure_com_initialized()
+    sc = import_soundcard()
     all_m = sc.all_microphones(include_loopback=True)
     if not (0 <= index < len(all_m)):
         raise IndexError("Нет устройства с таким индексом (soundcard).")
@@ -259,9 +258,7 @@ class LiveKitStreamClient:
             frame_samples = max(1, int(sample_rate) // 100)
 
             def _loopback_worker() -> None:
-                import soundcard as sc  # type: ignore[import-untyped]
-                from soundcard import SoundcardRuntimeWarning  # type: ignore[import-untyped]
-                from win_com import ensure_com_initialized
+                from win_com import format_soundcard_error, import_soundcard
 
                 try:
                     if sys.platform == "win32":
@@ -271,12 +268,14 @@ class LiveKitStreamClient:
                         ctypes.windll.kernel32.SetThreadPriority(
                             ctypes.windll.kernel32.GetCurrentThread(), 1
                         )
+                    sc = import_soundcard()
+                    from soundcard import SoundcardRuntimeWarning  # type: ignore[import-untyped]
+
                     warnings.filterwarnings(
                         "ignore",
                         message="data discontinuity in recording",
                         category=SoundcardRuntimeWarning,
                     )
-                    ensure_com_initialized()
                     all_m = sc.all_microphones(include_loopback=True)
                     sc_mic = all_m[lb_index]
                     ch = min(int(sc_mic.channels), 2)
@@ -306,9 +305,11 @@ class LiveKitStreamClient:
                             except queue.Full:
                                 pass
                 except Exception as e:
+                    # e очищается при выходе из except (Python 3.11+); сохраняем текст.
+                    err_text = format_soundcard_error(e)
 
                     def _fail() -> None:
-                        self.state.last_error = f"Захват звука экрана: {e}"
+                        self.state.last_error = f"Захват звука экрана: {err_text}"
                         self.ui_callback(self.state)
                         if self._stop_event:
                             self._stop_event.set()
