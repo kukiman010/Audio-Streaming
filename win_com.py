@@ -34,8 +34,11 @@ def ensure_com_initialized() -> None:
     import ctypes
 
     ole32 = ctypes.windll.ole32
+    # restype=HRESULT заставляет ctypes бросать OSError на «ошибки»,
+    # в т.ч. RPC_E_CHANGED_MODE (0x80010106) — тогда код ниже не видит HRESULT.
+    # PortAudio/sounddevice часто уже поднял COM в STA; для loopback это нормально.
     ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-    ole32.CoInitializeEx.restype = ctypes.HRESULT
+    ole32.CoInitializeEx.restype = ctypes.c_long
 
     hr = int(ole32.CoInitializeEx(None, _COINIT_MULTITHREADED))
     u = _hr_unsigned(hr)
