@@ -42,6 +42,7 @@ PACTL_BIN = shutil.which("pactl") or "/usr/bin/pactl"
 PREFIX = "MYAPP_"
 # Сначала каталог скрипта (Windows/запуск не из корня проекта), затем cwd с приоритетом переопределения.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GUI_SETTINGS_PATH = os.path.join(_SCRIPT_DIR, "gui_client.settings.json")
 load_env_files(
     (os.path.join(_SCRIPT_DIR, "livekit.env"), os.path.join(_SCRIPT_DIR, ".env")),
 )
@@ -52,6 +53,7 @@ DEFAULT_LIVEKIT_PORT = int(os.getenv("DEFAULT_LIVEKIT_PORT", "7880"))
 DEFAULT_HELPER_PORT = int(os.getenv("DEFAULT_HELPER_PORT", "8000"))
 # Legacy MP3 WebSocket (транспорт «не LiveKit») — если задан только хост
 DEFAULT_LEGACY_WS_PORT = int(os.getenv("DEFAULT_LEGACY_WS_PORT", "8765"))
+LIVEKIT_MAX_RECOVERY_ATTEMPTS = int(os.getenv("LIVEKIT_MAX_RECOVERY_ATTEMPTS", "3"))
 
 
 def _host_for_url(host: str) -> str:
@@ -65,7 +67,33 @@ def _host_for_url(host: str) -> str:
     return host
 
 
+def _load_gui_settings() -> dict:
+    try:
+        with open(GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def _save_gui_settings(*, server: str, pairing_secret: str) -> None:
+    data = _load_gui_settings()
+    data["server"] = server.strip()
+    data["pairing_secret"] = pairing_secret.strip()
+    try:
+        with open(GUI_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+
 def _default_gui_server_field() -> str:
+    saved = str(_load_gui_settings().get("server") or "").strip()
+    if saved:
+        return saved
     h = os.getenv("GUI_DEFAULT_SERVER", "").strip()
     if h:
         return h
@@ -80,6 +108,13 @@ def _default_gui_server_field() -> str:
         except Exception:
             pass
     return "127.0.0.1"
+
+
+def _default_gui_pairing_secret() -> str:
+    saved = str(_load_gui_settings().get("pairing_secret") or "").strip()
+    if saved:
+        return saved
+    return os.getenv("LIVEKIT_PAIRING_SECRET", "")
 
 
 def fetch_client_discovery(helper_url: str) -> Optional[dict]:
@@ -622,6 +657,8 @@ class LiveKitClientAdapter:
         device_id: Optional[str],
         channels: int,
         sample_rate: int,
+        token_provider: Optional[Callable[[], str]] = None,
+        max_recovery_attempts: int = LIVEKIT_MAX_RECOVERY_ATTEMPTS,
     ) -> None:
         asyncio.run_coroutine_threadsafe(
             self._client.start(
@@ -630,6 +667,8 @@ class LiveKitClientAdapter:
                 device_id=device_id,
                 channels=channels,
                 sample_rate=sample_rate,
+                token_provider=token_provider,
+                max_recovery_attempts=max_recovery_attempts,
             ),
             self._loop,
         )
@@ -650,6 +689,7 @@ class App(tk.Tk):
         self._audio_drawer_open = False
         self._helper_url_for_viewer: str = ""
         self._qr_photo_ref: Optional[tk.PhotoImage] = None
+        self._livekit_error_shown = False
 
         self.legacy_client = StreamClient(self.on_state_update)
         self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update)
@@ -690,9 +730,11 @@ class App(tk.Tk):
         ttk.Entry(frm, textvariable=self.var_identity, width=20).grid(row=3, column=3, sticky="we", **pad)
 
         ttk.Label(frm, text="Pairing secret:").grid(row=4, column=0, sticky="w", **pad)
-        self.var_pairing_secret = tk.StringVar(value=os.getenv("LIVEKIT_PAIRING_SECRET", ""))
+        self.var_pairing_secret = tk.StringVar(value=_default_gui_pairing_secret())
         self.entry_pairing_secret = ttk.Entry(frm, textvariable=self.var_pairing_secret, width=50, show="*")
         self.entry_pairing_secret.grid(row=4, column=1, sticky="we", **pad, columnspan=3)
+        self.entry_server.bind("<FocusOut>", lambda e: self._persist_connection_fields())
+        self.entry_pairing_secret.bind("<FocusOut>", lambda e: self._persist_connection_fields())
 
         # Источник: выдвижная панель (по умолчанию свёрнута; системный захват — без обязательного выбора в списке)
         self.var_win_route = tk.StringVar(value="system")
@@ -838,6 +880,12 @@ class App(tk.Tk):
 
         # Close handler
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _persist_connection_fields(self) -> None:
+        _save_gui_settings(
+            server=self.var_server.get(),
+            pairing_secret=self.var_pairing_secret.get(),
+        )
 
     def _make_qr_photo(self, url: str, size_px: int = 200) -> Optional[tk.PhotoImage]:
         try:
@@ -1085,6 +1133,7 @@ class App(tk.Tk):
         if not raw_server:
             messagebox.showerror("Ошибка", "Укажите сервер (IP, hostname или URL).")
             return
+        self._persist_connection_fields()
 
         if self.var_transport.get() == "LiveKit (native)":
             pairing_secret = self.var_pairing_secret.get().strip()
@@ -1143,12 +1192,20 @@ class App(tk.Tk):
                         if (0 <= dev_idx < len(self.input_devices))
                         else self.input_devices[0]
                     )
+                self._livekit_error_shown = False
                 self.livekit_client.start(
                     server_url=server_lk,
                     token=token,
                     device_id=device.device_id,
                     channels=int(self.var_channels.get()),
                     sample_rate=int(self.var_rate.get()),
+                    token_provider=lambda: request_publisher_token(
+                        helper_url=helper_url,
+                        room=room,
+                        identity=identity,
+                        pairing_secret=pairing_secret,
+                    ),
+                    max_recovery_attempts=LIVEKIT_MAX_RECOVERY_ATTEMPTS,
                 )
                 self.btn_start.config(state="disabled")
                 self.btn_stop.config(state="normal")
@@ -1201,20 +1258,46 @@ class App(tk.Tk):
     def on_livekit_state_update(self, state: LiveKitState):
         self.after(0, lambda s=state: self._render_livekit_state(s))
 
+    def _livekit_status_text(self, state: LiveKitState) -> Tuple[str, str]:
+        phase = state.phase
+        if phase == "connected":
+            return "Статус: online", "#0a0"
+        if phase == "reconnecting":
+            return "Статус: переподключение SDK…", "#b60"
+        if phase == "recovering":
+            return (
+                f"Статус: восстановление ({state.recovery_attempt}/{state.max_recovery_attempts})…",
+                "#b60",
+            )
+        if phase == "connecting":
+            return "Статус: подключение…", "#b60"
+        if state.last_error:
+            return "Статус: связь потеряна", "#b00"
+        return "Статус: offline", "#b00"
+
     def _render_livekit_state(self, state: LiveKitState):
         if state.running:
-            self.lbl_status.config(
-                text=f"Статус: {'online' if state.connected else 'подключение...'}",
-                foreground=("#0a0" if state.connected else "#b60"),
-            )
+            status_text, status_color = self._livekit_status_text(state)
+            self.lbl_status.config(text=status_text, foreground=status_color)
             self.btn_start.config(state="disabled")
             self.btn_stop.config(state="normal")
         else:
-            self.lbl_status.config(text="Статус: offline", foreground="#b00")
+            status_text, status_color = self._livekit_status_text(state)
+            self.lbl_status.config(text=status_text, foreground=status_color)
             self.btn_start.config(state="normal")
             self.btn_stop.config(state="disabled")
+            if state.last_error and not self._livekit_error_shown:
+                self._livekit_error_shown = True
+                messagebox.showwarning(
+                    "Связь потеряна",
+                    f"{state.last_error}\n\nНажмите «Старт» для повторного запуска трансляции.",
+                )
         self.lbl_extra.config(
-            text=f"LiveKit room: {state.room_name or '-'} | Connected: {'yes' if state.connected else 'no'}"
+            text=(
+                f"LiveKit room: {state.room_name or '-'} | "
+                f"SDK reconnect: {state.reconnect_count} | "
+                f"Восстановление: {state.recovery_attempt}/{state.max_recovery_attempts}"
+            )
         )
         self.title("Audio Streamer (LiveKit)")
         self._set_error_log(state.last_error or "")
@@ -1243,6 +1326,7 @@ class App(tk.Tk):
         self._set_error_log(state.last_error or "")
 
     def on_close(self):
+        self._persist_connection_fields()
         try:
             self.livekit_client.stop()
             self.legacy_client.stop()
