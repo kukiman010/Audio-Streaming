@@ -1,0 +1,2 @@
+# local.properties is not needed for Docker builds.
+# The builder image provides ANDROID_SDK via environment variables.

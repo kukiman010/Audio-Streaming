@@ -51,33 +51,22 @@ def list_microphone_devices_only() -> List[AudioInputDevice]:
 def list_windows_loopback_devices() -> Tuple[List[AudioInputDevice], Optional[str]]:
     """
     WASAPI loopback (soundcard). Возвращает (список, текст ошибки если список пуст).
-    Сначала import soundcard — на главном потоке поднимает COM внутри soundcard.
+    import_soundcard() поднимает COM и обходит S_FALSE (Error 0x100000001).
     """
     if platform.system().lower() != "windows":
         return [], None
     try:
-        import soundcard as sc  # type: ignore[import-untyped]
+        from win_com import format_soundcard_error, import_soundcard
+
+        sc = import_soundcard()
     except Exception as e:
         return [], f"soundcard: {e}"
-
-    try:
-        from win_com import ensure_com_initialized
-
-        ensure_com_initialized()
-    except OSError as e:
-        # часто COM уже поднят soundcard; перечисление всё равно пробуем
-        _com_warn = str(e)
-    else:
-        _com_warn = None
 
     out: List[AudioInputDevice] = []
     try:
         mics = sc.all_microphones(include_loopback=True)
     except Exception as e:
-        msg = f"{e}"
-        if _com_warn:
-            msg = f"{_com_warn}; {msg}"
-        return [], msg
+        return [], format_soundcard_error(e)
 
     for idx, m in enumerate(mics):
         if not getattr(m, "isloopback", False):
@@ -93,10 +82,10 @@ def list_windows_loopback_devices() -> Tuple[List[AudioInputDevice], Optional[st
         )
 
     if not out:
-        hint = "В системе не найдены loopback-устройства (запись выхода). Установите soundcard, проверьте драйверы."
-        if _com_warn:
-            hint = f"{_com_warn}. {hint}"
-        return [], hint
+        return [], (
+            "В системе не найдены loopback-устройства (запись выхода). "
+            "Установите soundcard, проверьте драйверы."
+        )
 
     # Первым — loopback того же выхода, что «По умолчанию» в Windows (наушники vs HDMI и т.д.)
     try:
