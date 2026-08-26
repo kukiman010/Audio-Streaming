@@ -20,6 +20,16 @@ PHASE_RECONNECTING = "reconnecting"
 PHASE_RECOVERING = "recovering"
 PHASE_OFFLINE = "offline"
 
+# Low-latency AudioSource buffer; frames are exactly 10 ms.
+# 100 ms ≈ 10 frames — enough for short GIL/asyncio stalls without radio-like delay.
+AUDIO_SOURCE_QUEUE_MS = 100
+# ~200 ms of 10 ms frames — drop-oldest keeps the live edge (prefer skip over lag).
+SYNC_QUEUE_MAXSIZE = 20
+# record() longer than this counts as a WASAPI gap.
+WASAPI_GAP_THRESHOLD_S = 0.015
+STATS_PUSH_INTERVAL_S = 1.0
+AUDIO_PUBLISH_BITRATE = 128_000
+
 
 @dataclass
 class LiveKitState:
@@ -33,6 +43,12 @@ class LiveKitState:
     max_recovery_attempts: int = 3
     last_error: str = ""
     started_at: float = 0.0
+    # Loopback capture / publish diagnostics
+    frames_captured: int = 0
+    frames_dropped: int = 0
+    wasapi_gaps_ms: float = 0.0
+    queue_depth: int = 0
+    queued_duration_ms: float = 0.0
 
 
 def _validate_sc_loopback_index(index: int) -> None:
@@ -54,6 +70,20 @@ def _is_soundcard_loopback_id(device_id: Optional[str]) -> bool:
     return t.startswith("sc_lb:")
 
 
+def _put_drop_oldest(sync_q: queue.Queue, frame: object, drop_counter: list) -> None:
+    """Enqueue frame; if full, discard the oldest frame to keep the live edge."""
+    while True:
+        try:
+            sync_q.put_nowait(frame)
+            return
+        except queue.Full:
+            try:
+                sync_q.get_nowait()
+                drop_counter[0] += 1
+            except queue.Empty:
+                pass
+
+
 class LiveKitStreamClient:
     def __init__(self, ui_callback: UpdateCallback):
         self.ui_callback = ui_callback
@@ -64,6 +94,7 @@ class LiveKitStreamClient:
         self._stop_event: Optional[asyncio.Event] = None
         self._sc_thread: Optional[threading.Thread] = None
         self._sc_pump_task: Optional[asyncio.Task] = None
+        self._sc_stats_task: Optional[asyncio.Task] = None
         self._sc_source: Optional[rtc.AudioSource] = None
         self._sc_sync_queue: Optional[queue.Queue] = None
         self._pump_enabled: Optional[asyncio.Event] = None
@@ -76,6 +107,10 @@ class LiveKitStreamClient:
         self._lb_index: Optional[int] = None
         self._recovery_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Shared with capture thread (list cells for atomic-ish updates without locks).
+        self._frames_captured = [0]
+        self._frames_dropped = [0]
+        self._wasapi_gaps_ms = [0.0]
 
     def _set_phase(self, phase: str) -> None:
         self.state.phase = phase
@@ -90,15 +125,20 @@ class LiveKitStreamClient:
         if self._pump_enabled is not None:
             self._pump_enabled.set()
 
-    def _drain_sc_queue(self) -> None:
+    def _sync_diag_to_state(self) -> None:
+        self.state.frames_captured = self._frames_captured[0]
+        self.state.frames_dropped = self._frames_dropped[0]
+        self.state.wasapi_gaps_ms = round(self._wasapi_gaps_ms[0], 1)
         q = self._sc_sync_queue
-        if q is None:
-            return
-        while True:
+        self.state.queue_depth = q.qsize() if q is not None else 0
+        src = self._sc_source
+        if src is not None:
             try:
-                q.get_nowait()
-            except queue.Empty:
-                break
+                self.state.queued_duration_ms = round(float(src.queued_duration) * 1000.0, 1)
+            except Exception:
+                self.state.queued_duration_ms = 0.0
+        else:
+            self.state.queued_duration_ms = 0.0
 
     def _register_room_handlers(self, room: rtc.Room) -> None:
         room.on("connection_state_changed", self._on_connection_state_changed)
@@ -110,17 +150,15 @@ class LiveKitStreamClient:
         if connection_state == rtc.ConnectionState.CONN_CONNECTED:
             if self.state.phase not in (PHASE_RECOVERING, PHASE_CONNECTING):
                 self._set_phase(PHASE_CONNECTED)
+                # Soft reconnect never pauses the pump; resume is for hard recovery.
                 self._resume_pump()
         elif connection_state == rtc.ConnectionState.CONN_RECONNECTING:
+            # Soft reconnect: keep pumping. Pausing fills sync_q → drop-oldest → audible holes.
             self._set_phase(PHASE_RECONNECTING)
-            self._pause_pump()
-            self._drain_sc_queue()
 
     def _on_reconnecting(self) -> None:
         self.state.reconnect_count += 1
         self._set_phase(PHASE_RECONNECTING)
-        self._pause_pump()
-        self._drain_sc_queue()
 
     def _on_reconnected(self) -> None:
         self.state.recovery_attempt = 0
@@ -154,8 +192,8 @@ class LiveKitStreamClient:
                 return
             self.state.recovery_attempt = attempt
             self._set_phase(PHASE_RECOVERING)
+            # Hard recovery tears down the room/track — pause only here, not on soft reconnect.
             self._pause_pump()
-            self._drain_sc_queue()
 
             try:
                 if self.room is not None:
@@ -204,6 +242,9 @@ class LiveKitStreamClient:
         self._pump_enabled = asyncio.Event()
         self._pump_enabled.set()
         self._loop = asyncio.get_running_loop()
+        self._frames_captured[0] = 0
+        self._frames_dropped[0] = 0
+        self._wasapi_gaps_ms[0] = 0.0
 
         self.state = LiveKitState(
             running=True,
@@ -251,11 +292,19 @@ class LiveKitStreamClient:
             _validate_sc_loopback_index(lb_index)
             self._lb_index = lb_index
 
-            source = rtc.AudioSource(int(sample_rate), 1, loop=loop)
+            source = rtc.AudioSource(
+                int(sample_rate),
+                1,
+                queue_size_ms=AUDIO_SOURCE_QUEUE_MS,
+                loop=loop,
+            )
             self._sc_source = source
-            sync_q: queue.Queue = queue.Queue(maxsize=200)
+            sync_q: queue.Queue = queue.Queue(maxsize=SYNC_QUEUE_MAXSIZE)
             self._sc_sync_queue = sync_q
             frame_samples = max(1, int(sample_rate) // 100)
+            frames_captured = self._frames_captured
+            frames_dropped = self._frames_dropped
+            wasapi_gaps_ms = self._wasapi_gaps_ms
 
             def _loopback_worker() -> None:
                 from win_com import format_soundcard_error, import_soundcard
@@ -271,11 +320,6 @@ class LiveKitStreamClient:
                     sc = import_soundcard()
                     from soundcard import SoundcardRuntimeWarning  # type: ignore[import-untyped]
 
-                    warnings.filterwarnings(
-                        "ignore",
-                        message="data discontinuity in recording",
-                        category=SoundcardRuntimeWarning,
-                    )
                     all_m = sc.all_microphones(include_loopback=True)
                     sc_mic = all_m[lb_index]
                     ch = min(int(sc_mic.channels), 2)
@@ -283,9 +327,29 @@ class LiveKitStreamClient:
                         int(sample_rate), channels=ch, blocksize=frame_samples
                     ) as rec:
                         while self._stop_event and not self._stop_event.is_set():
-                            data = rec.record(frame_samples)
+                            t0 = time.perf_counter()
+                            with warnings.catch_warnings(record=True) as caught:
+                                warnings.simplefilter("always", SoundcardRuntimeWarning)
+                                data = rec.record(frame_samples)
+                            for w in caught:
+                                if "data discontinuity" in str(w.message).lower():
+                                    wasapi_gaps_ms[0] += (
+                                        frame_samples / float(sample_rate) * 1000.0
+                                    )
+                            elapsed = time.perf_counter() - t0
+                            if elapsed > WASAPI_GAP_THRESHOLD_S:
+                                wasapi_gaps_ms[0] += (elapsed - WASAPI_GAP_THRESHOLD_S) * 1000.0
+
                             if data.shape[0] < frame_samples:
-                                continue
+                                # Pad short blocks instead of skipping (would create a hole).
+                                pad = frame_samples - data.shape[0]
+                                if data.ndim == 2:
+                                    pad_arr = np.zeros((pad, data.shape[1]), dtype=data.dtype)
+                                else:
+                                    pad_arr = np.zeros(pad, dtype=data.dtype)
+                                data = np.concatenate([data, pad_arr], axis=0)
+                                wasapi_gaps_ms[0] += pad / float(sample_rate) * 1000.0
+
                             if data.ndim == 2:
                                 if data.shape[1] >= 2:
                                     mono = (data[:, 0] + data[:, 1]) * 0.5
@@ -300,10 +364,8 @@ class LiveKitStreamClient:
                                 1,
                                 frame_samples,
                             )
-                            try:
-                                sync_q.put_nowait(frame)
-                            except queue.Full:
-                                pass
+                            _put_drop_oldest(sync_q, frame, frames_dropped)
+                            frames_captured[0] += 1
                 except Exception as e:
                     # e очищается при выходе из except (Python 3.11+); сохраняем текст.
                     err_text = format_soundcard_error(e)
@@ -321,6 +383,7 @@ class LiveKitStreamClient:
             )
             self._sc_thread.start()
             self._sc_pump_task = asyncio.create_task(self._pump_soundcard())
+            self._sc_stats_task = asyncio.create_task(self._stats_loop())
             self.track = rtc.LocalAudioTrack.create_audio_track("screen-audio", source)
         else:
             devices = rtc.MediaDevices(
@@ -338,38 +401,53 @@ class LiveKitStreamClient:
             self.mic = devices.open_input(**open_kwargs)
             self.track = rtc.LocalAudioTrack.create_audio_track("input", self.mic.source)
 
+    async def _stats_loop(self) -> None:
+        try:
+            while self._stop_event and not self._stop_event.is_set():
+                self._sync_diag_to_state()
+                self.ui_callback(self.state)
+                await asyncio.sleep(STATS_PUSH_INTERVAL_S)
+        except asyncio.CancelledError:
+            pass
+
     async def _pump_soundcard(self) -> None:
         assert self._sc_source is not None
         sync_q = self._sc_sync_queue
         try:
             while self._stop_event and not self._stop_event.is_set():
                 if self._pump_enabled is not None and not self._pump_enabled.is_set():
-                    self._drain_sc_queue()
+                    # Do not drain: capture keeps filling; drop-oldest preserves live edge.
                     await asyncio.sleep(0.05)
                     continue
                 if sync_q is None:
                     await asyncio.sleep(0.05)
                     continue
-                drained = False
-                for _ in range(32):
-                    try:
-                        frame = sync_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    drained = True
-                    if self._pump_enabled is not None and not self._pump_enabled.is_set():
-                        continue
-                    await self._sc_source.capture_frame(frame)
-                if not drained:
+                try:
+                    frame = sync_q.get_nowait()
+                except queue.Empty:
                     await asyncio.sleep(0.005)
+                    continue
+                if self._pump_enabled is not None and not self._pump_enabled.is_set():
+                    continue
+                await self._sc_source.capture_frame(frame)
         except asyncio.CancelledError:
             pass
+
+    def _build_publish_options(self) -> rtc.TrackPublishOptions:
+        opts = rtc.TrackPublishOptions()
+        opts.dtx = False
+        opts.red = True
+        opts.audio_encoding.max_bitrate = AUDIO_PUBLISH_BITRATE
+        if self._lb_index is not None:
+            opts.source = rtc.TrackSource.SOURCE_SCREENSHARE_AUDIO
+        else:
+            opts.source = rtc.TrackSource.SOURCE_MICROPHONE
+        return opts
 
     async def _publish_audio_track(self) -> None:
         if self.room is None or self.track is None:
             raise RuntimeError("Комната или трек не инициализированы")
-        opts = rtc.TrackPublishOptions()
-        opts.source = rtc.TrackSource.SOURCE_MICROPHONE
+        opts = self._build_publish_options()
         try:
             await self.room.local_participant.publish_track(self.track, opts)
         except Exception:
@@ -382,7 +460,12 @@ class LiveKitStreamClient:
     async def _recreate_loopback_track(self) -> None:
         loop = self._loop or asyncio.get_running_loop()
         old = self._sc_source
-        self._sc_source = rtc.AudioSource(self._sample_rate, 1, loop=loop)
+        self._sc_source = rtc.AudioSource(
+            self._sample_rate,
+            1,
+            queue_size_ms=AUDIO_SOURCE_QUEUE_MS,
+            loop=loop,
+        )
         self.track = rtc.LocalAudioTrack.create_audio_track("screen-audio", self._sc_source)
         if old is not None:
             try:
@@ -403,6 +486,16 @@ class LiveKitStreamClient:
 
         if self._stop_event and not self._stop_event.is_set():
             self._stop_event.set()
+
+        if self._sc_stats_task is not None:
+            t = self._sc_stats_task
+            self._sc_stats_task = None
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
         if self._sc_pump_task is not None:
             t = self._sc_pump_task
@@ -445,6 +538,7 @@ class LiveKitStreamClient:
 
         self.track = None
         self._pump_enabled = None
+        self._sync_diag_to_state()
         self.state.running = False
         self.state.connected = False
         self.state.phase = PHASE_OFFLINE

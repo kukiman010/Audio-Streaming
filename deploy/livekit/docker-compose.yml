@@ -9,7 +9,8 @@ services:
       - redis_data:/data
 
   livekit:
-    image: livekit/livekit-server:latest
+    # Pin major.minor — avoid silent Opus/ICE regressions from :latest.
+    image: livekit/livekit-server:v1.9
     restart: unless-stopped
     command: ["--config", "/etc/livekit/livekit.yaml"]
     depends_on:
@@ -17,7 +18,7 @@ services:
     ports:
       - "7880:7880/tcp"
       - "7881:7881/tcp"
-      - "50000-50100:50000-50100/udp"
+      - "50000-60000:50000-60000/udp"
     volumes:
       - ./livekit.yaml:/etc/livekit/livekit.yaml:ro
 

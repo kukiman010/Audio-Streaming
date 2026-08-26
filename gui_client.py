@@ -1296,7 +1296,11 @@ class App(tk.Tk):
             text=(
                 f"LiveKit room: {state.room_name or '-'} | "
                 f"SDK reconnect: {state.reconnect_count} | "
-                f"Восстановление: {state.recovery_attempt}/{state.max_recovery_attempts}"
+                f"Восстановление: {state.recovery_attempt}/{state.max_recovery_attempts} | "
+                f"drops: {state.frames_dropped} | "
+                f"q: {state.queue_depth} | "
+                f"queued: {state.queued_duration_ms:.0f} ms | "
+                f"wasapi_gaps: {state.wasapi_gaps_ms:.0f} ms"
             )
         )
         self.title("Audio Streamer (LiveKit)")

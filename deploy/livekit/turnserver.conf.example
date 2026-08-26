@@ -12,4 +12,4 @@ no-cli
 cert=/etc/letsencrypt/live/livekit.example.com/fullchain.pem
 pkey=/etc/letsencrypt/live/livekit.example.com/privkey.pem
 min-port=50000
-max-port=50100
+max-port=60000

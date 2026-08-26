@@ -48,6 +48,9 @@ class PlaybackService : Service() {
     private val audioTracks = mutableListOf<AudioTrack>()
     private lateinit var mediaSession: MediaSessionCompat
     private val waveformScratch = FloatArray(WAVEFORM_SCRATCH_SIZE)
+    /** Last absoluteCaptureTimestampMs seen by waveform sink (gap diagnostics). */
+    private var lastCaptureTimestampMs: Long = -1L
+    private var consecutiveSilentCallbacks: Int = 0
     private val waveformSink = object : AudioTrackSink {
         override fun onData(
             audioData: ByteBuffer?,
@@ -61,15 +64,36 @@ class PlaybackService : Service() {
                 return
             }
 
+            // Temporary diagnostics: PTS jump vs silence with steady PTS (DTX / capture hole).
+            if (lastCaptureTimestampMs >= 0L && absoluteCaptureTimestampMs > 0L) {
+                val expectedMs = (numberOfFrames * 1000L) / sampleRate.coerceAtLeast(1)
+                val deltaMs = absoluteCaptureTimestampMs - lastCaptureTimestampMs
+                if (deltaMs > expectedMs + GAP_PTS_TOLERANCE_MS) {
+                    Log.w(
+                        TAG,
+                        "audio PTS gap: delta=${deltaMs}ms expected~${expectedMs}ms " +
+                            "(frames=$numberOfFrames rate=$sampleRate)",
+                    )
+                }
+            }
+            if (absoluteCaptureTimestampMs > 0L) {
+                lastCaptureTimestampMs = absoluteCaptureTimestampMs
+            }
+
             val step = maxOf(1, numberOfFrames / WAVEFORM_POINTS_PER_CALLBACK)
             var scratchIndex = 0
             var frame = 0
+            var peakAbs = 0f
             while (frame < numberOfFrames && audioData.remaining() >= 2 * numberOfChannels) {
                 var peak = 0f
                 repeat(numberOfChannels) {
                     val sample = audioData.getShort().toFloat() / 32768f
-                    if (abs(sample) > abs(peak)) {
+                    val a = abs(sample)
+                    if (a > abs(peak)) {
                         peak = sample
+                    }
+                    if (a > peakAbs) {
+                        peakAbs = a
                     }
                 }
                 if (frame % step == 0) {
@@ -83,6 +107,22 @@ class PlaybackService : Service() {
             }
             if (scratchIndex > 0) {
                 WaveformSampleBuffer.write(waveformScratch, scratchIndex)
+            }
+
+            if (peakAbs < SILENCE_PEAK_THRESHOLD) {
+                consecutiveSilentCallbacks++
+                if (consecutiveSilentCallbacks == SILENCE_CALLBACKS_TO_LOG) {
+                    Log.w(
+                        TAG,
+                        "audio silence streak: ${consecutiveSilentCallbacks} callbacks " +
+                            "(peak<$SILENCE_PEAK_THRESHOLD) pts=$absoluteCaptureTimestampMs",
+                    )
+                }
+            } else {
+                if (consecutiveSilentCallbacks >= SILENCE_CALLBACKS_TO_LOG) {
+                    Log.i(TAG, "audio silence ended after $consecutiveSilentCallbacks callbacks")
+                }
+                consecutiveSilentCallbacks = 0
             }
         }
     }
@@ -284,6 +324,8 @@ class PlaybackService : Service() {
         WaveformSampleBuffer.clear()
         isSessionConnected = false
         isPaused = false
+        lastCaptureTimestampMs = -1L
+        consecutiveSilentCallbacks = 0
 
         val activeRoom = room
         room = null
@@ -472,6 +514,11 @@ class PlaybackService : Service() {
         private const val TAG = "PlaybackService"
         private const val WAVEFORM_POINTS_PER_CALLBACK = 24
         private const val WAVEFORM_SCRATCH_SIZE = 64
+        /** Log when capture timestamp jumps more than expected frame duration + this slack. */
+        private const val GAP_PTS_TOLERANCE_MS = 80L
+        private const val SILENCE_PEAK_THRESHOLD = 0.01f
+        /** ~0.5 s of silence at ~10–20 ms callbacks → log once. */
+        private const val SILENCE_CALLBACKS_TO_LOG = 25
         private const val REQUEST_PAUSE = 11
         private const val REQUEST_RESUME = 12
 

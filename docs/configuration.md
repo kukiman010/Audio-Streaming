@@ -61,7 +61,7 @@ docker compose -f deploy/livekit/docker-compose.yml restart livekit
 | 8000 | TCP | Helper | HTTP API, web-viewer |
 | 7880 | TCP | LiveKit | Signaling WebSocket |
 | 7881 | TCP | LiveKit | RTC over TCP (fallback) |
-| 50000–50100 | UDP | LiveKit | WebRTC media |
+| 50000–60000 | UDP | LiveKit | WebRTC media |
 | 3478 | UDP/TCP | coturn | STUN/TURN |
 | 5349 | TCP | coturn | TURN over TLS |
 
@@ -102,7 +102,20 @@ rtc:
   use_external_ip: true
 ```
 
-Убедитесь, что UDP 50000–50100 проброшены через NAT/firewall.
+Убедитесь, что UDP 50000–60000 проброшены через NAT/firewall.
+
+После смены диапазона портов или тега образа перезапустите стек и синхронизируйте рабочий `livekit.yaml` / `turnserver.conf` с `*.example` (примерники в репозитории уже на `50000–60000` и `livekit/livekit-server:v1.9`).
+
+## Low-latency publish notes
+
+Publisher (`livekit_client.py`) targets realtime music/game audio:
+
+- `AUDIO_SOURCE_QUEUE_MS = 100` — small LiveKit buffer (not the SDK default 1000 ms).
+- Soft SDK reconnect keeps pumping frames (no pause → no drop-oldest burst).
+- Hard recovery still pauses while the room/track is torn down and republished.
+- Sync queue stays drop-oldest (~200 ms) so lag does not grow under load.
+
+SFU deploy: UDP media **50000–60000**, image **`livekit/livekit-server:v1.9`** (pinned). After pulling example changes, copy them into your local `livekit.yaml` / `turnserver.conf` and recreate the compose stack.
 
 ## Troubleshooting
 

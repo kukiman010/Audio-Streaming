@@ -100,7 +100,7 @@ python server.py --host 0.0.0.0 --port 8000
 | 8000 | TCP | Helper (`server.py`) |
 | 7880 | TCP | LiveKit signaling (WebSocket) |
 | 7881 | TCP | LiveKit RTC TCP |
-| 50000–50100 | UDP | LiveKit media |
+| 50000–60000 | UDP | LiveKit media |
 | 3478, 5349 | UDP/TCP | coturn (TURN) |
 
 Для удалённых клиентов в `livekit.env` задайте публичный IP или домен:
