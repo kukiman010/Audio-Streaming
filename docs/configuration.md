@@ -4,10 +4,10 @@
 
 | Файл | Назначение |
 |------|------------|
-| `livekit.env` | Секреты и URL для Python-компонентов (не коммитить) |
+| `livekit.env` | **Единственное место хранения секретов** и URL (не коммитить). Читают Python-компоненты и docker-compose |
 | `livekit.env.example` | Шаблон переменных окружения |
-| `deploy/livekit/livekit.yaml` | Конфиг LiveKit Server (ключи, порты, TURN) |
-| `deploy/livekit/turnserver.conf` | Конфиг coturn |
+| `deploy/livekit/livekit.yaml` | Конфиг LiveKit Server (порты, TURN), без секретов |
+| `deploy/livekit/turnserver.conf` | Конфиг coturn, без секретов |
 | `deploy/livekit/docker-compose.yml` | Оркестрация контейнеров |
 
 Первичная настройка:
@@ -16,7 +16,7 @@
 python setup_livekit.py
 ```
 
-Скрипт генерирует секреты, записывает их в `livekit.env` и синхронизирует `LIVEKIT_API_SECRET` в `livekit.yaml`.
+Скрипт генерирует недостающие секреты и записывает их только в `livekit.env`; уже заданные секреты не перегенерируются, а URL/порты из `livekit.env` становятся значениями по умолчанию, поэтому повторный запуск безопасен. Неинтерактивно: `python3 setup_livekit.py -y --public-host 1.2.3.4` (задаёт `LIVEKIT_URL=ws://1.2.3.4:7880` и `HELPER_URL=http://1.2.3.4:8000`).
 
 ## Переменные `livekit.env`
 
@@ -25,6 +25,7 @@ python setup_livekit.py
 | `LIVEKIT_API_KEY` | да | Имя API-ключа LiveKit |
 | `LIVEKIT_API_SECRET` | да | Секрет для подписи JWT (32+ байт в production) |
 | `LIVEKIT_PAIRING_SECRET` | да | Секрет для `/livekit/publisher_token` |
+| `TURN_STATIC_AUTH_SECRET` | да | Shared secret coturn (`static-auth-secret`) |
 | `LIVEKIT_URL` | да | WebSocket URL LiveKit для клиентов (`ws://` или `wss://`) |
 | `HELPER_URL` | рекомендуется | Публичный HTTP URL helper для удалённых клиентов |
 | `HELPER_HOST` | нет | Bind-адрес helper (по умолчанию `0.0.0.0`) |
@@ -35,24 +36,25 @@ python setup_livekit.py
 
 `gui_client.py` и `server.py` автоматически загружают `livekit.env` и `.env` при старте.
 
-## Синхронизация ключей
+## Где хранятся секреты
 
-`LIVEKIT_API_KEY` и `LIVEKIT_API_SECRET` в `livekit.env` **должны совпадать** с секцией `keys:` в `deploy/livekit/livekit.yaml`:
+Все секреты лежат только в `livekit.env`. Отдельно синхронизировать их не нужно:
 
-```yaml
-keys:
-  devkey: your_long_secret_here
-```
+- `server.py` и `gui_client.py` читают `livekit.env` напрямую;
+- `docker-compose.yml` подставляет значения из `livekit.env` (`--env-file livekit.env`):
+  LiveKit получает ключи через переменную `LIVEKIT_KEYS`, coturn — флаг `--static-auth-secret`.
 
-LiveKit читает `livekit.yaml` только при старте контейнера. После правки ключей:
+Поэтому все команды docker compose запускайте с `--env-file`:
 
 ```bash
-docker compose -f deploy/livekit/docker-compose.yml restart livekit
+docker compose --env-file livekit.env -f deploy/livekit/docker-compose.yml up -d
 ```
 
-`start_server.sh` делает restart автоматически. Без перезапуска helper выдаёт JWT по новому секрету, а LiveKit проверяет по старому — результат HTTP 401.
+После смены секрета в `livekit.env` перезапустите `./start_server.sh` (или команду выше): `up -d` пересоздаст контейнеры с новыми значениями. Обычный `restart` переменные окружения не обновляет.
 
-При запуске `server.py` выводит проверку совпадения ключей в stderr.
+При запуске `server.py` подписывает тестовый токен и проверяет его на запущенном LiveKit (`/rtc/validate`); при расхождении секретов в stderr выводится предупреждение.
+
+Старые установки, где ключи лежали в `livekit.yaml` (`keys:`) и `turnserver.conf` (`static-auth-secret=`), `start_server.sh` мигрирует автоматически.
 
 ## Порты и firewall
 
@@ -61,7 +63,8 @@ docker compose -f deploy/livekit/docker-compose.yml restart livekit
 | 8000 | TCP | Helper | HTTP API, web-viewer |
 | 7880 | TCP | LiveKit | Signaling WebSocket |
 | 7881 | TCP | LiveKit | RTC over TCP (fallback) |
-| 50000–60000 | UDP | LiveKit | WebRTC media |
+| 7882 | UDP | LiveKit | WebRTC media (единый порт, `rtc.udp_port`) |
+| 50000–60000 | UDP | coturn | TURN relay (если используется TURN) |
 | 3478 | UDP/TCP | coturn | STUN/TURN |
 | 5349 | TCP | coturn | TURN over TLS |
 
@@ -102,9 +105,9 @@ rtc:
   use_external_ip: true
 ```
 
-Убедитесь, что UDP 50000–60000 проброшены через NAT/firewall.
+Убедитесь, что UDP 7882 проброшен через NAT/firewall.
 
-После смены диапазона портов или тега образа перезапустите стек и синхронизируйте рабочий `livekit.yaml` / `turnserver.conf` с `*.example` (примерники в репозитории уже на `50000–60000` и `livekit/livekit-server:v1.9`).
+Медиа идёт через один UDP-порт (`rtc.udp_port: 7882`), а не через диапазон: проброс 10 000 портов через docker-proxy порождает отдельный процесс на каждый порт. После смены портов или тега образа синхронизируйте рабочий `livekit.yaml` с `livekit.yaml.example` и пересоздайте стек.
 
 ## Low-latency publish notes
 
@@ -115,7 +118,7 @@ Publisher (`livekit_client.py`) targets realtime music/game audio:
 - Hard recovery still pauses while the room/track is torn down and republished.
 - Sync queue stays drop-oldest (~200 ms) so lag does not grow under load.
 
-SFU deploy: UDP media **50000–60000**, image **`livekit/livekit-server:v1.9`** (pinned). After pulling example changes, copy them into your local `livekit.yaml` / `turnserver.conf` and recreate the compose stack.
+SFU deploy: UDP media **7882** (single muxed port), image **`livekit/livekit-server:v1.9`** (pinned). After pulling example changes, copy them into your local `livekit.yaml` / `turnserver.conf` and recreate the compose stack.
 
 ## Troubleshooting
 

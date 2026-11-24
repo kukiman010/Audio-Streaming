@@ -2,6 +2,7 @@
 import argparse
 import html
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -19,7 +20,7 @@ def build_token(api_key: str, api_secret: str, room: str, identity: str, publish
         can_publish=publish,
         can_subscribe=True,
     )
-    # strip: случайные пробелы/перевод строк в .env ломают подпись JWT vs yaml на сервере
+    # strip: случайные пробелы/перевод строк в .env ломают подпись JWT
     key, secret = api_key.strip(), api_secret.strip()
     return (
         api.AccessToken(key, secret)
@@ -220,58 +221,39 @@ def _client_facing_helper_url(bind_port: int) -> str:
 
 def collect_livekit_key_mismatch_warnings() -> list[str]:
     """
-    401 от LiveKit («invalid token» / «no permissions») почти всегда из‑за того, что
-    LIVEKIT_API_KEY / LIVEKIT_API_SECRET в livekit.env не совпадают с keys: в deploy/livekit/livekit.yaml.
+    401 от LiveKit («invalid token» / «no permissions») почти всегда из‑за того, что контейнер
+    LiveKit запущен с другим секретом. Секрет хранится только в livekit.env, поэтому вместо сверки
+    файлов проверяем живой сервер: подписываем токен и отправляем его на /rtc/validate.
     """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
     warnings: list[str] = []
-    yaml_path = _SCRIPT_DIR / "deploy" / "livekit" / "livekit.yaml"
     api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
     api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
     if not api_key or not api_secret:
-        warnings.append("LIVEKIT_API_KEY или LIVEKIT_API_SECRET пусты в окружении.")
-        return warnings
-    if not yaml_path.is_file():
-        warnings.append(f"Нет файла {yaml_path} — проверка ключей пропущена.")
-        return warnings
-    try:
-        import yaml
-    except ImportError:
-        warnings.append("Установите PyYAML (pip install PyYAML), чтобы проверять ключи против livekit.yaml.")
-        return warnings
-    try:
-        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        warnings.append(f"Не удалось прочитать livekit.yaml: {e}")
-        return warnings
-    keys = (data or {}).get("keys") if isinstance(data, dict) else None
-    if not isinstance(keys, dict):
-        warnings.append("В livekit.yaml нет секции keys — проверьте конфиг Docker LiveKit.")
-        return warnings
-    if api_key not in keys:
-        warnings.append(
-            f"LIVEKIT_API_KEY={api_key!r} отсутствует в keys в livekit.yaml "
-            f"(есть ключи: {list(keys.keys())}). Токены будут отклонены с 401."
-        )
-        return warnings
-    yaml_secret = str(keys.get(api_key) or "").strip()
-    if yaml_secret != api_secret:
-        warnings.append(
-            "КРИТИЧНО: LIVEKIT_API_SECRET в livekit.env не совпадает с секретом для этого API-ключа "
-            f"в deploy/livekit/livekit.yaml (ключ {api_key!r}). "
-            "Выровняйте значения и выполните: "
-            "`docker compose -f deploy/livekit/docker-compose.yml restart livekit`."
-        )
+        warnings.append("LIVEKIT_API_KEY или LIVEKIT_API_SECRET пусты в livekit.env.")
         return warnings
 
+    lk_url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880").strip().rstrip("/")
+    http_url = re.sub(r"^ws", "http", lk_url, count=1)
+    token = build_token(api_key, api_secret, "audio-room", "key-probe", False)
+    probe_url = f"{http_url}/rtc/validate?" + urllib.parse.urlencode({"access_token": token})
     try:
-        import jwt
-    except ImportError:
-        return warnings
-    try:
-        probe = build_token(api_key, api_secret, "audio-room", "jwt-probe", True)
-        jwt.decode(probe, api_secret, algorithms=["HS256"], options={"verify_aud": False})
+        with urllib.request.urlopen(probe_url, timeout=3):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            warnings.append(
+                f"КРИТИЧНО: LiveKit ({http_url}) отклоняет токен, подписанный LIVEKIT_API_SECRET из livekit.env. "
+                "Контейнер запущен со старым секретом — пересоздайте его: "
+                "`docker compose --env-file livekit.env -f deploy/livekit/docker-compose.yml up -d livekit`."
+            )
+        else:
+            warnings.append(f"LiveKit ({http_url}) ответил HTTP {e.code} на проверку токена.")
     except Exception as e:
-        warnings.append(f"JWT из тех же ключей локально не проходит проверку подписи: {e}")
+        warnings.append(f"Не удалось проверить ключи на LiveKit ({http_url}): {e}")
     return warnings
 
 
@@ -311,7 +293,7 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
     lines += [
         "",
         f"  Helper слушает:           http://{bind_host}:{bind_port}/",
-        "  Ошибка 401 при подключении к LiveKit: см. проверку ключей выше (livekit.env ↔ livekit.yaml).",
+        "  Ошибка 401 при подключении к LiveKit: см. проверку ключей ниже (livekit.env ↔ запущенный LiveKit).",
         "=" * 72,
         "",
     ]
@@ -324,7 +306,7 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
             print(f"    • {msg}", file=sys.stderr)
         print("", file=sys.stderr)
     else:
-        print("Проверка: ключи в livekit.env совпадают с deploy/livekit/livekit.yaml; JWT подпись локально валидна.", file=sys.stderr)
+        print("Проверка: LiveKit принимает токены, подписанные ключами из livekit.env.", file=sys.stderr)
         print("", file=sys.stderr)
 
     print(
@@ -332,8 +314,8 @@ def print_client_connection_banner(*, bind_host: str, bind_port: int) -> None:
         file=sys.stderr,
     )
     print(
-        "  • Контейнер livekit после правки livekit.yaml должен быть перезапущен "
-        "(start_server.sh теперь делает restart автоматически).",
+        "  • После смены секретов в livekit.env перезапустите ./start_server.sh "
+        "(он пересоздаст контейнеры с новыми значениями).",
         file=sys.stderr,
     )
     print(

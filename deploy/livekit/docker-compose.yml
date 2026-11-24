@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
@@ -13,12 +11,18 @@ services:
     image: livekit/livekit-server:v1.9
     restart: unless-stopped
     command: ["--config", "/etc/livekit/livekit.yaml"]
+    # Единственный источник секретов — livekit.env (передаётся через --env-file).
+    # Ключи в livekit.yaml не хранятся.
+    environment:
+      LIVEKIT_KEYS: '${LIVEKIT_API_KEY:?run with --env-file livekit.env}: "${LIVEKIT_API_SECRET:?run with --env-file livekit.env}"'
     depends_on:
       - redis
+    # Один UDP-порт с мультиплексированием (rtc.udp_port) вместо диапазона:
+    # проброс 50000–60000 через docker-proxy порождает процесс на каждый порт.
     ports:
       - "7880:7880/tcp"
       - "7881:7881/tcp"
-      - "50000-60000:50000-60000/udp"
+      - "7882:7882/udp"
     volumes:
       - ./livekit.yaml:/etc/livekit/livekit.yaml:ro
 
@@ -26,7 +30,10 @@ services:
     image: coturn/coturn:4.6
     restart: unless-stopped
     network_mode: host
-    command: ["-c", "/etc/coturn/turnserver.conf"]
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_STATIC_AUTH_SECRET:?run with --env-file livekit.env}"
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
 

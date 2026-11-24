@@ -4,18 +4,19 @@ bind_addresses:
 
 rtc:
   tcp_port: 7881
-  port_range_start: 50000
-  port_range_end: 60000
+  # Весь WebRTC-медиатрафик через один UDP-порт (должен совпадать с docker-compose.yml)
+  udp_port: 7882
   use_external_ip: true
 
 redis:
   address: redis:6379
 
-keys:
-  devkey: REPLACE_WITH_LONG_SECRET
+# Ключи API здесь не задаются: docker-compose передаёт их из livekit.env
+# через переменную LIVEKIT_KEYS (LIVEKIT_API_KEY / LIVEKIT_API_SECRET).
 
+# Встроенный TURN LiveKit требует TLS-сертификатов; по умолчанию используется внешний coturn.
 turn:
-  enabled: true
+  enabled: false
   domain: livekit.example.com
   cert_file: /certs/fullchain.pem
   key_file: /certs/privkey.pem

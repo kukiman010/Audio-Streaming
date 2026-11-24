@@ -40,6 +40,16 @@ if [[ ! -f "livekit.env" || ! -f "deploy/livekit/livekit.yaml" || ! -f "deploy/l
   python "setup_livekit.py"
 fi
 
+# Секреты хранятся только в livekit.env. Старые установки держали копии в livekit.yaml (keys:)
+# и turnserver.conf (static-auth-secret) — переносим их в livekit.env без вопросов.
+if grep -q '^keys:' "deploy/livekit/livekit.yaml" \
+  || grep -q '^static-auth-secret=' "deploy/livekit/turnserver.conf" \
+  || ! grep -q '^TURN_STATIC_AUTH_SECRET=.' "livekit.env"; then
+  echo "Migrating secrets into livekit.env (single source of truth)..."
+  require_supported_python
+  python "setup_livekit.py" -y
+fi
+
 require_supported_python
 ensure_python_env
 
@@ -64,14 +74,22 @@ if [[ ! -f "deploy/livekit/turnserver.conf" ]]; then
   exit 1
 fi
 
-echo "Starting LiveKit stack with Docker Compose..."
-docker compose -f "deploy/livekit/docker-compose.yml" up -d
+DOCKER=(docker)
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker daemon is not accessible for $(id -un); using sudo docker"
+  DOCKER=(sudo docker)
+fi
 
-# LiveKit читает keys из примонтированного livekit.yaml только при старте процесса.
-# Без перезапуска после правки файла контейнер продолжает жить со старыми ключами —
-# тогда helper выдаёт «правильный» JWT по новому livekit.env, а сервер проверяет по старому секрету → HTTP 401.
+# Секреты для LiveKit (LIVEKIT_KEYS) и coturn подставляются из livekit.env.
+# up -d пересоздаёт контейнеры, если секреты в livekit.env изменились.
+COMPOSE=("${DOCKER[@]}" compose --env-file "livekit.env" -f "deploy/livekit/docker-compose.yml")
+
+echo "Starting LiveKit stack with Docker Compose..."
+"${COMPOSE[@]}" up -d
+
+# Правки примонтированного livekit.yaml (порты, TURN) LiveKit видит только после перезапуска процесса.
 echo "Restarting livekit container to reload /etc/livekit/livekit.yaml..."
-docker compose -f "deploy/livekit/docker-compose.yml" restart livekit
+"${COMPOSE[@]}" restart livekit
 sleep 2
 
 HP="${HELPER_PORT:-8000}"

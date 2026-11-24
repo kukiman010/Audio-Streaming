@@ -45,16 +45,16 @@
 ## Быстрый старт
 
 ```bash
-# 1. Зависимости Python
-python -m pip install -r requirements.txt
+# 1. Первичная настройка: генерирует секреты в livekit.env (единственное место их хранения),
+#    создаёт livekit.yaml / turnserver.conf без секретов.
+#    --public-host — IP или домен, по которому клиенты достучатся до сервера; -y — без вопросов.
+python3 setup_livekit.py -y --public-host YOUR_PUBLIC_IP
 
-# 2. Первичная настройка (генерирует секреты, создаёт конфиги)
-python setup_livekit.py
-
-# 3. LiveKit (Docker) + helper-сервер
+# 2. LiveKit (Docker) + helper-сервер. Скрипт сам создаст .venv и поставит зависимости;
+#    если пользователь не в группе docker — использует sudo docker.
 ./start_server.sh
 
-# 4. Publisher на той же или другой машине
+# 3. Publisher на той же или другой машине (pip install -r requirements.txt)
 python gui_client.py
 ```
 
@@ -76,8 +76,8 @@ python gui_client.py
 cp livekit.env.example livekit.env
 cp deploy/livekit/livekit.yaml.example deploy/livekit/livekit.yaml
 cp deploy/livekit/turnserver.conf.example deploy/livekit/turnserver.conf
-# Заполните секреты и публичные URL, затем:
-docker compose -f deploy/livekit/docker-compose.yml up -d
+# Заполните секреты и публичные URL в livekit.env, затем:
+docker compose --env-file livekit.env -f deploy/livekit/docker-compose.yml up -d
 python server.py --host 0.0.0.0 --port 8000
 ```
 
@@ -87,9 +87,8 @@ python server.py --host 0.0.0.0 --port 8000
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
-python setup_livekit.py
-docker compose -f deploy/livekit/docker-compose.yml up -d
-docker compose -f deploy/livekit/docker-compose.yml restart livekit
+python setup_livekit.py --public-host YOUR_PUBLIC_IP
+docker compose --env-file livekit.env -f deploy/livekit/docker-compose.yml up -d
 python server.py --host 0.0.0.0 --port 8000
 ```
 
@@ -100,8 +99,9 @@ python server.py --host 0.0.0.0 --port 8000
 | 8000 | TCP | Helper (`server.py`) |
 | 7880 | TCP | LiveKit signaling (WebSocket) |
 | 7881 | TCP | LiveKit RTC TCP |
-| 50000–60000 | UDP | LiveKit media |
-| 3478, 5349 | UDP/TCP | coturn (TURN) |
+| 7882 | UDP | LiveKit media (один мультиплексированный порт, `rtc.udp_port`) |
+| 3478, 5349 | UDP/TCP | coturn (TURN, опционально) |
+| 50000–60000 | UDP | coturn relay (только если используется TURN) |
 
 Для удалённых клиентов в `livekit.env` задайте публичный IP или домен:
 
@@ -168,8 +168,9 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 
 | Переменная | Описание |
 |------------|----------|
-| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Ключи LiveKit (должны совпадать с `keys:` в `livekit.yaml`) |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Ключи LiveKit (передаются в контейнер через docker-compose) |
 | `LIVEKIT_PAIRING_SECRET` | Секрет для выдачи publisher-токена GUI-клиенту |
+| `TURN_STATIC_AUTH_SECRET` | Shared secret coturn |
 | `LIVEKIT_URL` | WebSocket URL LiveKit для клиентов |
 | `HELPER_URL` | Публичный URL helper-сервера |
 | `HELPER_HOST` / `HELPER_PORT` | Bind-адрес helper при запуске |
@@ -181,7 +182,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 - Используйте UDP и рабочий TURN (coturn) для клиентов за NAT.
 - Начинайте с 48 kHz, 1–2 канала.
 - Для production задавайте длинные секреты (`LIVEKIT_API_SECRET` — 32+ байт).
-- После смены ключей в `livekit.yaml` перезапустите контейнер LiveKit: `docker compose -f deploy/livekit/docker-compose.yml restart livekit`.
+- Все секреты хранятся только в `livekit.env`; после их смены перезапустите `./start_server.sh` (контейнеры пересоздадутся).
 - Синхронизируйте время (NTP) на сервере и клиентах — JWT зависит от `exp` / `nbf`.
 
 ## Проверка
