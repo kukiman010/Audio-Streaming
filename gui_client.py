@@ -25,6 +25,7 @@ from audio_devices import (
     list_microphone_devices_only,
     list_windows_loopback_devices,
 )
+from latency_trace import MAX_LOG_LINES, compose_log
 from livekit_client import LiveKitStreamClient, LiveKitState
 from env_loader import load_env_files
 
@@ -640,8 +641,13 @@ class contextlib_suppress:
 
 
 class LiveKitClientAdapter:
-    def __init__(self, ui_callback: Callable[[LiveKitState], None]):
+    def __init__(
+        self,
+        ui_callback: Callable[[LiveKitState], None],
+        trace_callback: Optional[Callable[[str], None]] = None,
+    ):
         self._client = LiveKitStreamClient(ui_callback)
+        self._client.trace_callback = trace_callback
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="livekit-loop")
         self._thread.start()
@@ -676,6 +682,16 @@ class LiveKitClientAdapter:
     def stop(self) -> None:
         asyncio.run_coroutine_threadsafe(self._client.stop(), self._loop)
 
+    @property
+    def tracing(self) -> bool:
+        return self._client.tracing
+
+    def start_trace(self) -> None:
+        asyncio.run_coroutine_threadsafe(self._client.start_trace(), self._loop)
+
+    def stop_trace(self) -> None:
+        asyncio.run_coroutine_threadsafe(self._client.stop_trace(), self._loop)
+
 # ---------------- Tkinter GUI ----------------
 
 class App(tk.Tk):
@@ -690,9 +706,11 @@ class App(tk.Tk):
         self._helper_url_for_viewer: str = ""
         self._qr_photo_ref: Optional[tk.PhotoImage] = None
         self._livekit_error_shown = False
+        self._error_text = ""
+        self._trace_lines: List[str] = []
 
         self.legacy_client = StreamClient(self.on_state_update)
-        self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update)
+        self.livekit_client = LiveKitClientAdapter(self.on_livekit_state_update, self.on_trace_line)
         self.transport_values = ["LiveKit (native)"] + (["Legacy WS+FFmpeg"] if ENABLE_LEGACY_TRANSPORT else [])
         self.input_devices: List[AudioInputDevice] = []
         self.loopback_devices: List[AudioInputDevice] = []
@@ -833,6 +851,8 @@ class App(tk.Tk):
         # Buttons
         self.btn_start = ttk.Button(frm, text="Старт", command=self.on_start)
         self.btn_stop = ttk.Button(frm, text="Стоп", command=self.on_stop, state="disabled")
+        self.btn_trace = ttk.Button(frm, text="Замеры", command=self.on_trace_toggle, state="disabled")
+        self.btn_trace.grid(row=12, column=0, **pad, sticky="we")
         self.btn_start.grid(row=12, column=2, **pad, sticky="we")
         self.btn_stop.grid(row=12, column=3, **pad, sticky="we")
 
@@ -974,16 +994,48 @@ class App(tk.Tk):
         self._update_audio_drawer_summary()
 
     def _set_error_log(self, text: str) -> None:
+        self._error_text = (text or "").strip()
+        self._redraw_log()
+
+    def _redraw_log(self) -> None:
+        # Ошибка и строки замеров делят одну панель: ни то ни другое не стирает друг друга.
+        text = compose_log(self._error_text, self._trace_lines)
         self.txt_errors.configure(state="normal")
         self.txt_errors.delete("1.0", "end")
         if text:
             self.txt_errors.insert("1.0", text)
+            self.txt_errors.see("end")
         self.txt_errors.configure(state="disabled")
-        err = (text or "").strip()
-        if err:
+        if text.strip():
             self.frm_errors.grid(row=14, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 6))
         else:
             self.frm_errors.grid_remove()
+
+    def on_trace_line(self, text: str) -> None:
+        self.after(0, lambda t=text: self._append_trace_line(t))
+
+    def _append_trace_line(self, text: str) -> None:
+        self._trace_lines.append(text)
+        del self._trace_lines[:-MAX_LOG_LINES]
+        self._redraw_log()
+        self._sync_trace_button()
+
+    def _sync_trace_button(self) -> None:
+        connected = self.var_transport.get() == "LiveKit (native)" and self.livekit_client.state.phase == "connected"
+        tracing = self.livekit_client.tracing
+        self.btn_trace.config(
+            text="Остановить замеры" if tracing else "Замеры",
+            state="normal" if (connected or tracing) else "disabled",
+        )
+
+    def on_trace_toggle(self) -> None:
+        if self.livekit_client.tracing:
+            self.livekit_client.stop_trace()
+        else:
+            self._trace_lines.clear()
+            self._redraw_log()
+            self.livekit_client.start_trace()
+        self.after(400, self._sync_trace_button)
 
     def _toggle_audio_drawer(self) -> None:
         self._audio_drawer_open = not self._audio_drawer_open
@@ -1305,6 +1357,7 @@ class App(tk.Tk):
         )
         self.title("Audio Streamer (LiveKit)")
         self._set_error_log(state.last_error or "")
+        self._sync_trace_button()
 
     def on_state_update(self, state: StreamState):
         self.after(0, lambda s=state: self._render_state(s))
