@@ -102,13 +102,57 @@ async def index(request: web.Request) -> web.Response:
     <button id="join">Join room</button>
     <div class="status" id="status">offline</div>
     <audio id="audio" autoplay controls></audio>
+    <div class="status" id="latency"></div>
   </div>
   <script type="module">
-    import {{ Room }} from "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.esm.mjs";
+    import {{ Room, RoomEvent }} from "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.esm.mjs";
     const joinBtn = document.getElementById("join");
     const status = document.getElementById("status");
     const audio = document.getElementById("audio");
+    const latencyEl = document.getElementById("latency");
     let roomRef = null;
+    let audioTrackRef = null;
+    let latencyTimer = null;
+    let prevJb = null;
+
+    // Замер задержки: стример шлёт lat.ping, мы отвечаем lat.pong со своими RTT и буфером.
+    async function collectStats() {{
+      let sfu = null, jb = null;
+      try {{
+        const rep = await audioTrackRef.getRTCStatsReport();
+        rep.forEach((s) => {{
+          if (s.type === "inbound-rtp" && s.kind === "audio" && s.jitterBufferEmittedCount > 0) {{
+            // Средняя задержка буфера за последний интервал; если новых сэмплов нет — за всё время.
+            const dCount = prevJb ? s.jitterBufferEmittedCount - prevJb.count : 0;
+            const dDelay = prevJb ? s.jitterBufferDelay - prevJb.delay : 0;
+            jb = (dCount > 0 ? dDelay / dCount : s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000;
+            prevJb = {{ count: s.jitterBufferEmittedCount, delay: s.jitterBufferDelay }};
+          }}
+          if (s.type === "candidate-pair" && s.nominated && typeof s.currentRoundTripTime === "number") {{
+            sfu = s.currentRoundTripTime * 1000;
+          }}
+        }});
+      }} catch (e) {{}}
+      return {{ sfu, jb }};
+    }}
+
+    async function onLatencyPing(lkRoom, payload, participant) {{
+      let ping;
+      try {{ ping = JSON.parse(new TextDecoder().decode(payload)); }} catch (e) {{ return; }}
+      if (!ping || ping.v !== 1 || !Number.isInteger(ping.id) || !participant) return;
+      const st = audioTrackRef ? await collectStats() : {{ sfu: null, jb: null }};
+      const pong = {{ v: 1, id: ping.id, sfu_rtt_ms: st.sfu, jitter_buffer_ms: st.jb }};
+      lkRoom.localParticipant.publishData(
+        new TextEncoder().encode(JSON.stringify(pong)),
+        {{ reliable: false, topic: "lat.pong", destinationIdentities: [participant.identity] }}
+      ).catch(() => {{}});
+      const ok = [ping.pub_rtt_ms, st.sfu, st.jb].every((v) => typeof v === "number");
+      latencyEl.textContent = ok
+        ? "≈ " + Math.round((ping.pub_rtt_ms + st.sfu) / 2 + st.jb) + " мс (оценка задержки, идёт замер)"
+        : "идёт замер задержки…";
+      clearTimeout(latencyTimer);
+      latencyTimer = setTimeout(() => {{ latencyEl.textContent = ""; }}, 3000);
+    }}
 
     joinBtn.addEventListener("click", async () => {{
       try {{
@@ -131,12 +175,17 @@ async def index(request: web.Request) -> web.Response:
         const lkRoom = new Room();
         function attachIfAudio(track) {{
           if (track && track.kind === "audio") {{
+            audioTrackRef = track;
+            prevJb = null;
             track.attach(audio);
             status.textContent = "audio subscribed";
           }}
         }}
         lkRoom.on("trackSubscribed", (track) => attachIfAudio(track));
-        lkRoom.on("disconnected", () => {{ status.textContent = "disconnected"; }});
+        lkRoom.on("disconnected", () => {{ status.textContent = "disconnected"; latencyEl.textContent = ""; }});
+        lkRoom.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {{
+          if (topic === "lat.ping") onLatencyPing(lkRoom, payload, participant);
+        }});
         await lkRoom.connect(url, tokenJson.token);
         roomRef = lkRoom;
         status.textContent = "connected";
