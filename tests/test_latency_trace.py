@@ -143,5 +143,74 @@ class PongHandlerTests(unittest.TestCase):
             self.assertEqual(lines, [], name)
 
 
+class TraceLoopTests(unittest.IsolatedAsyncioTestCase):
+    def _client(self):
+        from types import SimpleNamespace
+        from livekit_client import LiveKitStreamClient
+
+        sent = []
+
+        async def get_rtc_stats():
+            return SimpleNamespace(publisher_stats=[], subscriber_stats=[])
+
+        async def publish_data(payload, **kw):
+            sent.append((payload, kw))
+
+        c = LiveKitStreamClient(lambda s: None)
+        lines = []
+        c.trace_callback = lines.append
+        c.state.phase = "connected"
+        c.room = SimpleNamespace(
+            remote_participants={},
+            get_rtc_stats=get_rtc_stats,
+            local_participant=SimpleNamespace(publish_data=publish_data),
+        )
+        return c, lines, sent
+
+    async def test_empty_room_pings_and_reports_no_listeners(self):
+        import asyncio
+        import json
+
+        c, lines, sent = self._client()
+        await c.start_trace()
+        await asyncio.sleep(0.2)
+        await c.stop_trace()
+        self.assertFalse(c.tracing)
+        self.assertTrue(any("слушателей нет" in s for s in lines), lines)
+        self.assertTrue(any("остановлено" in s for s in lines), lines)
+        payload, kw = sent[0]
+        self.assertEqual(kw, {"reliable": False, "topic": lt.TOPIC_PING})
+        self.assertEqual(json.loads(payload)["v"], 1)
+
+    async def test_phase_change_stops_trace(self):
+        import asyncio
+
+        c, lines, _ = self._client()
+        await c.start_trace()
+        c._set_phase("reconnecting")
+        await asyncio.sleep(0.1)
+        self.assertFalse(c.tracing)
+
+    async def test_stop_during_start_does_not_leave_loop_running(self):
+        import asyncio
+
+        c, lines, sent = self._client()
+        orig = c.room.get_rtc_stats
+
+        async def slow_stats():
+            await asyncio.sleep(0.1)
+            return await orig()
+
+        c.room.get_rtc_stats = slow_stats
+        starting = asyncio.create_task(c.start_trace())
+        await asyncio.sleep(0.02)
+        await c.stop_trace()
+        await starting
+        await asyncio.sleep(0.3)
+        self.assertFalse(c.tracing)
+        self.assertIsNone(c._trace_task)
+        self.assertEqual(sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()

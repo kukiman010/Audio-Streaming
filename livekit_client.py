@@ -474,6 +474,8 @@ class LiveKitStreamClient:
             conn = extract_conn_type(list(stats.publisher_stats))
         except Exception:
             conn = "н/д"
+        if not self._tracing:  # остановили, пока ждали статистику
+            return
         self._emit_trace(f"[замер] старт. Соединение стримера: {conn}")
         self._trace_task = asyncio.create_task(self._trace_loop())
 
