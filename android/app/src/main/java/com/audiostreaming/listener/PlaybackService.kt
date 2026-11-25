@@ -21,7 +21,9 @@ import io.livekit.android.LiveKit
 import io.livekit.android.LiveKitOverrides
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
+import io.livekit.android.room.DataPublishReliability
 import io.livekit.android.room.Room
+import io.livekit.android.room.participant.Participant
 import io.livekit.android.room.track.AudioTrack
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -29,8 +31,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import livekit.org.webrtc.AudioTrackSink
 import java.nio.ByteBuffer
 import java.util.concurrent.CancellationException as JavaCancellationException
@@ -41,6 +47,8 @@ class PlaybackService : Service() {
     private var room: Room? = null
     private var eventsJob: Job? = null
     private var connectJob: Job? = null
+    private var latencyResetJob: Job? = null
+    private val jitterAverager = JitterBufferAverager()
     private var currentRoomName: String = ""
     private var activeConnectKey: String? = null
     private var isPaused = false
@@ -246,6 +254,16 @@ class PlaybackService : Service() {
                                 }
                             }
 
+                            is RoomEvent.DataReceived -> {
+                                if (event.topic == LatencyTrace.TOPIC_PING) {
+                                    val sender = event.participant?.identity
+                                    val ping = parsePing(event.data)
+                                    if (ping != null && sender != null) {
+                                        launch { answerLatencyPing(liveKitRoom, ping, sender) }
+                                    }
+                                }
+                            }
+
                             is RoomEvent.Disconnected -> {
                                 isSessionConnected = false
                                 broadcastStatus(STATUS_DISCONNECTED, "disconnected")
@@ -280,6 +298,64 @@ class PlaybackService : Service() {
             }
         }
     }
+
+    /** Ответ на lat.ping от стримера: наши RTT и jitter buffer; оценку задержки показываем в уведомлении. */
+    private suspend fun answerLatencyPing(
+        liveKitRoom: Room,
+        ping: Ping,
+        sender: Participant.Identity,
+    ) {
+        val stats = withTimeoutOrNull(LatencyTrace.STATS_TIMEOUT_MS) { collectLatencyStats(liveKitRoom) }
+        val sfuRtt = stats?.first
+        val jitterBuffer = stats?.second
+        liveKitRoom.localParticipant.publishData(
+            data = buildPong(ping.id, sfuRtt, jitterBuffer),
+            reliability = DataPublishReliability.LOSSY,
+            topic = LatencyTrace.TOPIC_PONG,
+            identities = listOf(sender),
+        )
+        val pubRtt = ping.pubRttMs
+        if (pubRtt != null && sfuRtt != null && jitterBuffer != null) {
+            val text = getString(R.string.notification_connected, currentRoomName) +
+                " · ≈ ${estimateMs(pubRtt, sfuRtt, jitterBuffer).toInt()} мс"
+            updateNotification(text)
+        }
+        latencyResetJob?.cancel()
+        latencyResetJob = serviceScope.launch {
+            delay(LatencyTrace.QUIET_TIMEOUT_MS)
+            if (isSessionConnected && !isPaused) {
+                updateNotification(getString(R.string.notification_connected, currentRoomName))
+            }
+        }
+    }
+
+    /** (RTT до сервера в мс, средний jitter buffer в мс) из статистики подписчика WebRTC. */
+    private suspend fun collectLatencyStats(liveKitRoom: Room): Pair<Double?, Double?> =
+        suspendCancellableCoroutine { cont ->
+            liveKitRoom.getSubscriberRTCStats { report ->
+                var sfu: Double? = null
+                var jb: Double? = null
+                report.statsMap.values.forEach { stat ->
+                    val m = stat.members
+                    when (stat.type) {
+                        "candidate-pair" ->
+                            if (m["nominated"] == true) {
+                                sfu = (m["currentRoundTripTime"] as? Number)?.toDouble()?.times(1000.0)
+                            }
+
+                        "inbound-rtp" ->
+                            if (m["kind"] == "audio") {
+                                val delay = (m["jitterBufferDelay"] as? Number)?.toDouble()
+                                val count = (m["jitterBufferEmittedCount"] as? Number)?.toDouble()
+                                if (delay != null && count != null) {
+                                    jb = jitterAverager.update(delay, count)
+                                }
+                            }
+                    }
+                }
+                if (cont.isActive) cont.resume(sfu to jb)
+            }
+        }
 
     private fun pausePlayback() {
         if (!isSessionConnected || isPaused) {

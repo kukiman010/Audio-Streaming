@@ -64,4 +64,8 @@ dependencies {
         exclude(group = "com.github.davidliu", module = "audioswitch")
     }
     implementation(project(":audioswitch"))
+
+    testImplementation("junit:junit:4.13.2")
+    // Заглушки org.json в android.jar для JVM-тестов не работают; нужна настоящая реализация.
+    testImplementation("org.json:json:20231013")
 }
