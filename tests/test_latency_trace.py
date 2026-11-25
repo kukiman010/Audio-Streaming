@@ -69,5 +69,79 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(lt.compose_log("", []), "")
 
 
+class StatsExtractTests(unittest.TestCase):
+    @staticmethod
+    def _stats(**kw):
+        from livekit.rtc._proto import stats_pb2 as sp
+
+        return sp.RtcStats(**kw)
+
+    def test_extract_pub_rtt_from_real_proto(self):
+        st = self._stats(remote_inbound_rtp={"remote_inbound": {"round_trip_time": 0.062}})
+        self.assertAlmostEqual(lt.extract_pub_rtt_ms([st]), 62.0)
+        self.assertIsNone(lt.extract_pub_rtt_ms([]))
+
+    def test_extract_pub_rtt_falls_back_to_candidate_pair(self):
+        st = self._stats(candidate_pair={"candidate_pair": {"current_round_trip_time": 0.07}})
+        self.assertAlmostEqual(lt.extract_pub_rtt_ms([st]), 70.0)
+
+    def test_extract_conn_type(self):
+        def conn(ctype, proto):
+            return [
+                self._stats(candidate_pair={"rtc": {"id": "p"}, "candidate_pair": {
+                    "nominated": True, "local_candidate_id": "l"}}),
+                self._stats(local_candidate={"rtc": {"id": "l"}, "candidate": {
+                    "candidate_type": ctype, "protocol": proto}}),
+            ]
+
+        self.assertEqual(lt.extract_conn_type(conn("RELAY", "udp")), "relay (TURN)")
+        self.assertEqual(lt.extract_conn_type(conn("HOST", "udp")), "UDP")
+        self.assertEqual(lt.extract_conn_type(conn("SRFLX", "tcp")), "TCP")
+        self.assertEqual(lt.extract_conn_type([]), "н/д")
+
+
+class PongHandlerTests(unittest.TestCase):
+    def _client(self, tracing=True):
+        from types import SimpleNamespace
+        from livekit_client import LiveKitStreamClient
+
+        lines = []
+        c = LiveKitStreamClient(lambda s: None)
+        c.trace_callback = lines.append
+        c.room = SimpleNamespace(remote_participants={"android-viewer": object()})
+        c._tracing = tracing
+        c._trace_pending = {5: (0.0, 60.0)}
+        return c, lines
+
+    @staticmethod
+    def _packet(data, topic=lt.TOPIC_PONG, identity="android-viewer"):
+        from types import SimpleNamespace
+
+        who = SimpleNamespace(identity=identity) if identity else None
+        return SimpleNamespace(data=data, topic=topic, participant=who)
+
+    PONG5 = b'{"v":1,"id":5,"sfu_rtt_ms":50,"jitter_buffer_ms":900}'
+
+    def test_valid_pong_emits_line(self):
+        c, lines = self._client()
+        c._on_data_received(self._packet(self.PONG5))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("android-viewer", lines[0])
+        self.assertIn("буфер клиента 900 мс", lines[0])
+
+    def test_ignored_cases(self):
+        for name, client_kw, pkt in [
+            ("stopped", {"tracing": False}, self._packet(self.PONG5)),
+            ("old id", {}, self._packet(b'{"v":1,"id":4}')),
+            ("garbage", {}, self._packet(b"\xff\xfe")),
+            ("other topic", {}, self._packet(self.PONG5, topic="chat")),
+            ("no sender", {}, self._packet(self.PONG5, identity=None)),
+            ("not in room", {}, self._packet(self.PONG5, identity="ghost")),
+        ]:
+            c, lines = self._client(**client_kw)
+            c._on_data_received(pkt)
+            self.assertEqual(lines, [], name)
+
+
 if __name__ == "__main__":
     unittest.main()

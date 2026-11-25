@@ -112,6 +112,38 @@ class TraceStats:
         return out
 
 
+def extract_pub_rtt_ms(stats: list) -> Optional[float]:
+    """RTT стримера до сервера (мс): из remote_inbound_rtp, иначе из candidate_pair. stats — list[RtcStats]."""
+    for st in stats:
+        if st.HasField("remote_inbound_rtp"):
+            rtt = st.remote_inbound_rtp.remote_inbound.round_trip_time
+            if rtt > 0:
+                return rtt * 1000.0
+    for st in stats:
+        if st.HasField("candidate_pair"):
+            rtt = st.candidate_pair.candidate_pair.current_round_trip_time
+            if rtt > 0:
+                return rtt * 1000.0
+    return None
+
+
+def extract_conn_type(stats: list) -> str:
+    """UDP / TCP / relay (TURN) по выбранной паре ICE-кандидатов; иначе «н/д»."""
+    local_ids = [
+        st.candidate_pair.candidate_pair.local_candidate_id
+        for st in stats
+        if st.HasField("candidate_pair") and st.candidate_pair.candidate_pair.nominated
+    ]
+    for st in stats:
+        if st.HasField("local_candidate") and st.local_candidate.rtc.id in local_ids:
+            cand = st.local_candidate.candidate
+            enum = cand.DESCRIPTOR.fields_by_name["candidate_type"].enum_type
+            if enum.values_by_number[cand.candidate_type].name == "RELAY":
+                return "relay (TURN)"
+            return "TCP" if cand.protocol.lower() == "tcp" else "UDP"
+    return "н/д"
+
+
 def compose_log(error_text: str, trace_lines: List[str]) -> str:
     lines = ([error_text] if error_text else []) + list(trace_lines[-MAX_LOG_LINES:])
     return "\n".join(lines)

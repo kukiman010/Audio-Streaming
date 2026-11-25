@@ -11,6 +11,18 @@ from typing import Callable, Optional
 import numpy as np
 from livekit import rtc
 
+from latency_trace import (
+    TOPIC_PING,
+    TOPIC_PONG,
+    TraceStats,
+    compute_stages,
+    decode_pong,
+    encode_ping,
+    extract_conn_type,
+    extract_pub_rtt_ms,
+    format_line,
+)
+
 TokenProvider = Callable[[], str]
 UpdateCallback = Callable[["LiveKitState"], None]
 
@@ -111,10 +123,24 @@ class LiveKitStreamClient:
         self._frames_captured = [0]
         self._frames_dropped = [0]
         self._wasapi_gaps_ms = [0.0]
+        # Трассировка задержки: см. docs/superpowers/specs/2026-11-25-latency-trace-design.md
+        self.trace_callback: Optional[Callable[[str], None]] = None
+        self._tracing = False
+        self._trace_task: Optional[asyncio.Task] = None
+        self._trace_seq = 0
+        self._trace_pending: dict = {}  # id -> (t_sent_ms, pub_rtt_ms)
+        self._trace_answered: dict = {}  # identity -> id последнего ответа
+        self._trace_stats = TraceStats()
+
+    @property
+    def tracing(self) -> bool:
+        return self._tracing
 
     def _set_phase(self, phase: str) -> None:
         self.state.phase = phase
         self.state.connected = phase == PHASE_CONNECTED
+        if phase != PHASE_CONNECTED and self._tracing:
+            asyncio.ensure_future(self.stop_trace())
         self.ui_callback(self.state)
 
     def _pause_pump(self) -> None:
@@ -145,6 +171,7 @@ class LiveKitStreamClient:
         room.on("reconnecting", self._on_reconnecting)
         room.on("reconnected", self._on_reconnected)
         room.on("disconnected", self._on_disconnected)
+        room.on("data_received", self._on_data_received)
 
     def _on_connection_state_changed(self, connection_state: rtc.ConnectionState.ValueType) -> None:
         if connection_state == rtc.ConnectionState.CONN_CONNECTED:
@@ -410,6 +437,92 @@ class LiveKitStreamClient:
         except asyncio.CancelledError:
             pass
 
+    # ---- трассировка задержки ----
+
+    def _emit_trace(self, text: str) -> None:
+        if self.trace_callback is not None:
+            self.trace_callback(text)
+
+    def _on_data_received(self, packet) -> None:
+        """Ответ слушателя на ping; всё лишнее (мусор, старый id, чужой topic) тихо игнорируется."""
+        if not self._tracing or packet.topic != TOPIC_PONG or packet.participant is None:
+            return
+        identity = packet.participant.identity
+        if self.room is None or identity not in self.room.remote_participants:
+            return
+        pong = decode_pong(packet.data)
+        sent = self._trace_pending.get(pong.id) if pong is not None else None
+        if sent is None:
+            return
+        t_sent, pub_rtt = sent
+        loop_ms = time.monotonic() * 1000.0 - t_sent
+        stages = compute_stages(pub_rtt, loop_ms, pong.jitter_buffer_ms)
+        self._trace_answered[identity] = max(pong.id, self._trace_answered.get(identity, 0))
+        self._trace_stats.add(identity, stages)
+        self._emit_trace(format_line(identity, stages))
+
+    async def start_trace(self) -> None:
+        if self._tracing or self.room is None or self.state.phase != PHASE_CONNECTED:
+            return
+        self._trace_seq = 0
+        self._trace_pending = {}
+        self._trace_answered = {}
+        self._trace_stats = TraceStats()
+        self._tracing = True
+        try:
+            stats = await self.room.get_rtc_stats()
+            conn = extract_conn_type(list(stats.publisher_stats))
+        except Exception:
+            conn = "н/д"
+        self._emit_trace(f"[замер] старт. Соединение стримера: {conn}")
+        self._trace_task = asyncio.create_task(self._trace_loop())
+
+    async def stop_trace(self) -> None:
+        if not self._tracing:
+            return
+        self._tracing = False
+        task, self._trace_task = self._trace_task, None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        for line in self._trace_stats.summary_lines():
+            self._emit_trace(line)
+        self._emit_trace("[замер] остановлено")
+
+    async def _trace_loop(self) -> None:
+        try:
+            while self._tracing and self.room is not None:
+                try:
+                    stats = await self.room.get_rtc_stats()
+                    pub_rtt = extract_pub_rtt_ms(list(stats.publisher_stats))
+                    self._trace_seq += 1
+                    ping_id = self._trace_seq
+                    now = time.monotonic() * 1000.0
+                    self._trace_pending[ping_id] = (now, pub_rtt)
+                    self._trace_pending = {
+                        k: v for k, v in self._trace_pending.items() if now - v[0] < 5000.0
+                    }
+                    listeners = list(self.room.remote_participants.keys())
+                    if not listeners:
+                        self._emit_trace("[замер] слушателей нет")
+                    elif ping_id >= 2:
+                        for identity in listeners:
+                            if self._trace_answered.get(identity, 0) < ping_id - 1:
+                                self._emit_trace(format_line(identity, None))
+                    await self.room.local_participant.publish_data(
+                        encode_ping(ping_id, now, pub_rtt), reliable=False, topic=TOPIC_PING
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._emit_trace(f"[замер] ошибка: {e}")
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
     async def _pump_soundcard(self) -> None:
         assert self._sc_source is not None
         sync_q = self._sc_sync_queue
@@ -475,6 +588,7 @@ class LiveKitStreamClient:
 
     async def stop(self) -> None:
         self._user_stop = True
+        await self.stop_trace()
 
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
